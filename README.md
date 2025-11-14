@@ -246,6 +246,44 @@ curl -sS -X DELETE http://127.0.0.1:8088/nupf-ee/v1/ee-subscriptions/SUB_ID
 * **Termination & remaining data:** On N4 session release, send a final report with a termination cause and any remaining data for the last interval.
 * **Security & robustness:** Auth (token or mTLS), bounded retries with backoff/jitter, structured error classes, and counters for success/failure.
 * **API expansion:** `GET`/`PATCH` for subscription query/update; `/healthz` and `/version` endpoints.
+* **NRF Registration for UPF EES**
+  UPF EES should register its NF Profile to NRF (NF type = `UPF`) including:
+
+  * Supported service: **Nupf_EventExposure**
+  * Supported measurement types (e.g., `USER_DATA_USAGE_MEASURES`)
+  * Connectivity information (`nfService`, `ipEndPoints`, `fqdn`)
+    This enables other NFs such as **NWDAF** and **DCCF** to discover UPF EES dynamically.
+
+* **NRF-Based NF Discovery for Consumers**
+  NWDAF or DCCF, acting as EES consumers, should use **Nnrf_NFDiscovery_Request** to locate UPF instances based on:
+
+  * S-NSSAI
+  * DNN
+  * DNAI
+  * UPF capabilities (e.g., user-data-usage-measurements support)
+    This aligns with TS 23.502 §4.15.4.5 (Nnrf-based UPF selection for analytics subscription).
+
+* **Indirect Subscription via SMF with NRF Lookups**
+  When NWDAF subscribes indirectly through SMF, SMF should:
+
+  * Query NRF to determine the appropriate UPF for a given PDU session,
+  * Then send `Nupf_EventExposure_Subscribe` to that UPF.
+    This ensures correct UPF selection even in multi-UPF deployments.
+
+* **UE-IP Direct Subscription (NRF-Assisted Routing)**
+  For *Certain UE* targeting (UE IP or SUPI), future EES extensions should:
+
+  * Determine the serving UPF using NRF discovery (TS 23.502 §4.15.4.5.5),
+  * Route the direct subscription to the correct UPF instance.
+
+* **NRF Operation Observability**
+  Add structured logs and metrics for:
+
+  * NRF registration lifecycle
+  * Heartbeats
+  * NFDiscovery requests & results
+  * UPF service availability updates
+    This helps debug distributed deployments and UPF selection behavior.
 
 ---
 
