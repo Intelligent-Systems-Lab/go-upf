@@ -14,8 +14,11 @@
 package ees
 
 import (
+	"fmt"
 	"sync"
 	"time"
+
+	"github.com/free5gc/go-upf/internal/report"
 )
 
 // pfcpEntry stores one URR's latest interval counters and its last update time.
@@ -35,10 +38,23 @@ type PFCPSource struct {
 	staleAfter time.Duration
 }
 
-var GlobalPFCPSource *PFCPSource
+// ForwarderDriver 定義與底層轉發層 (如 gtp5g) 溝通的介面
+// 對應 internal/forwarder/driver.go 中的實作
+type ForwarderDriver interface {
+	QueryMultiURR(map[uint64][]uint32) (map[uint64][]report.USAReport, error)
+}
 
-func SetGlobalPFCPSource(source *PFCPSource) {
-	GlobalPFCPSource = source
+// SessionProvider 定義獲取活躍 Session 資訊的介面
+// 對應 internal/pfcp/node.go 中 LocalNode 的實作
+type SessionProvider interface {
+	GetSessionContexts() map[uint64]SessionContext
+}
+
+// [實作 Source]
+// ActivePFCPSource 是一個無狀態的 Source，每次 SnapshotNow 都會主動向底層查詢最新數據。
+type ActivePFCPSource struct {
+	driver          ForwarderDriver
+	sessionProvider SessionProvider
 }
 
 // NewPFCPSource creates a PFCPSource with the given staleness threshold.
@@ -97,6 +113,9 @@ func (pfcpSource *PFCPSource) OnUSAReport(
 //   - EndTime:   max over fresh URRs
 //
 // A session is included only if at least one URR is fresh.
+
+//this is the old version kept for reference
+/*
 func (pfcpSource *PFCPSource) SnapshotNow() (map[SessionKey]Counters, error) {
 	now := time.Now()
 
@@ -115,7 +134,6 @@ func (pfcpSource *PFCPSource) SnapshotNow() (map[SessionKey]Counters, error) {
 			if now.Sub(urrEntry.lastUpdateTime) > pfcpSource.staleAfter {
 				continue // stale URR entry; skip
 			}
-
 			urrIntervalCounters := urrEntry.latestCounters
 
 			if !hasFresh {
@@ -130,14 +148,13 @@ func (pfcpSource *PFCPSource) SnapshotNow() (map[SessionKey]Counters, error) {
 				}
 				hasFresh = true
 				continue
+			} else {
+				// sum bytes/packets across URRs
+				merged.ULBytes += urrIntervalCounters.ULBytes
+				merged.DLBytes += urrIntervalCounters.DLBytes
+				merged.ULPackets += urrIntervalCounters.ULPackets
+				merged.DLPackets += urrIntervalCounters.DLPackets
 			}
-
-			// sum bytes/packets across URRs
-			merged.ULBytes += urrIntervalCounters.ULBytes
-			merged.DLBytes += urrIntervalCounters.DLBytes
-			merged.ULPackets += urrIntervalCounters.ULPackets
-			merged.DLPackets += urrIntervalCounters.DLPackets
-
 			// expand interval boundaries
 			if urrIntervalCounters.StartTime.Before(merged.StartTime) {
 				merged.StartTime = urrIntervalCounters.StartTime
@@ -153,7 +170,8 @@ func (pfcpSource *PFCPSource) SnapshotNow() (map[SessionKey]Counters, error) {
 	}
 
 	return mergedBySession, nil
-}
+}*/
+//end of old version
 
 // PruneStale removes sessions that have no fresh URR entries (all URRs are stale).
 // This is optional; the aggregator already cleans per-subscription snapshots.
@@ -178,4 +196,99 @@ func (pfcpSource *PFCPSource) PruneStale() (removedCount int) {
 		}
 	}
 	return removedCount
+}
+
+// NewActivePFCPSource 建構子
+func NewActivePFCPSource(driver ForwarderDriver, provider SessionProvider) *ActivePFCPSource {
+	return &ActivePFCPSource{
+		driver:          driver,
+		sessionProvider: provider,
+	}
+}
+
+// SnapshotNow 執行主動查詢 (Active Pull)
+// 1. 從 Provider 獲取所有 Session 上下文
+// 2. 向 Driver 批量查詢 URR 數據
+// 3. 聚合數據並回傳
+func (s *ActivePFCPSource) SnapshotNow() (map[SessionKey]Counters, error) {
+	// 1. 獲取當前活躍的 Session 列表
+	sessionCtxs := s.sessionProvider.GetSessionContexts()
+	if len(sessionCtxs) == 0 {
+		return nil, nil
+	}
+
+	// 2. 準備批量查詢的參數 (map[LocalSEID] -> []URRID)
+	queryMap := make(map[uint64][]uint32, len(sessionCtxs))
+	for lSeid, ctx := range sessionCtxs {
+		if len(ctx.URRIDs) > 0 {
+			queryMap[lSeid] = ctx.URRIDs
+		}
+	}
+
+	if len(queryMap) == 0 {
+		return nil, nil
+	}
+
+	// 3. 呼叫 Driver 執行批量查詢 (Netlink 交互)
+	reportsMap, err := s.driver.QueryMultiURR(queryMap)
+	if err != nil {
+		return nil, fmt.Errorf("active query failed: %w", err)
+	}
+
+	// 4. 轉換並聚合結果
+	result := make(map[SessionKey]Counters, len(reportsMap))
+
+	for lSeid, reports := range reportsMap {
+		ctx, ok := sessionCtxs[lSeid]
+		if !ok {
+			// 在查詢期間 Session 可能剛好被刪除，忽略此結果
+			continue
+		}
+
+		// 聚合該 Session 下多個 URR 的數據
+		var merged Counters
+		var hasFresh bool
+
+		for _, r := range reports {
+			// 如果需要過濾 Stale 數據 (例如 Kernel 很久沒更新)，可以在這裡判斷 r.EndTime
+			// 但通常 Active Query 取得的都是 Kernel 當下的數值
+
+			if !hasFresh {
+				// 第一筆數據，直接初始化
+				merged = Counters{
+					ULBytes:   r.VolumMeasure.UplinkVolume,
+					DLBytes:   r.VolumMeasure.DownlinkVolume,
+					ULPackets: r.VolumMeasure.UplinkPktNum,
+					DLPackets: r.VolumMeasure.DownlinkPktNum,
+					StartTime: r.StartTime,
+					EndTime:   r.EndTime,
+				}
+				hasFresh = true
+			} else {
+				// 後續數據，進行累加
+				merged.ULBytes += r.VolumMeasure.UplinkVolume
+				merged.DLBytes += r.VolumMeasure.DownlinkVolume
+				merged.ULPackets += r.VolumMeasure.UplinkPktNum
+				merged.DLPackets += r.VolumMeasure.DownlinkPktNum
+
+				// 時間區間取聯集 (Start 取最早，End 取最晚)
+				if !r.StartTime.IsZero() && r.StartTime.Before(merged.StartTime) {
+					merged.StartTime = r.StartTime
+				}
+				if !r.EndTime.IsZero() && r.EndTime.After(merged.EndTime) {
+					merged.EndTime = r.EndTime
+				}
+			}
+		}
+
+		if hasFresh {
+			key := SessionKey{
+				LocalSEID:  lSeid,
+				RemoteSEID: ctx.RemoteSEID,
+			}
+			result[key] = merged
+		}
+	}
+
+	return result, nil
 }

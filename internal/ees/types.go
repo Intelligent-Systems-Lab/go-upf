@@ -106,3 +106,8 @@ type Subscription struct {
 type Source interface {
 	SnapshotNow() (map[SessionKey]Counters, error)
 }
+
+type SessionContext struct {
+	RemoteSEID uint64
+	URRIDs     []uint32
+}

@@ -33,6 +33,8 @@ type Driver interface {
 	RemoveURR(uint64, *ie.IE) ([]report.USAReport, error)
 	QueryURR(uint64, uint32) ([]report.USAReport, error)
 
+	QueryMultiURR(map[uint64][]uint32) (map[uint64][]report.USAReport, error)
+
 	CreateBAR(uint64, *ie.IE) error
 	UpdateBAR(uint64, *ie.IE) error
 	RemoveBAR(uint64, *ie.IE) error

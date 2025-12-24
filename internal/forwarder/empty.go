@@ -75,5 +75,9 @@ func (Empty) QueryURR(uint64, uint32) ([]report.USAReport, error) {
 	return nil, nil
 }
 
+func (Empty) QueryMultiURR(map[uint64][]uint32) (map[uint64][]report.USAReport, error) {
+	return nil, nil
+}
+
 func (Empty) HandleReport(report.Handler) {
 }
