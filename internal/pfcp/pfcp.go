@@ -399,3 +399,7 @@ func setReqSeq(msgtmp message.Message, seq uint32) {
 	default:
 	}
 }
+
+func (s *PfcpServer) GetLocalNode() *LocalNode {
+	return &s.lnode
+}

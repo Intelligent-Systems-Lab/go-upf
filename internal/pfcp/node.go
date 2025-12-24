@@ -8,6 +8,8 @@ import (
 	"github.com/sirupsen/logrus"
 	"github.com/wmnsk/go-pfcp/ie"
 
+	"github.com/free5gc/go-upf/internal/ees"
+
 	"github.com/free5gc/go-upf/internal/forwarder"
 	"github.com/free5gc/go-upf/internal/report"
 	logger_util "github.com/free5gc/util/logger"
@@ -687,4 +689,36 @@ func (n *LocalNode) DeleteSess(lSeid uint64) ([]report.USAReport, error) {
 	n.sess[i] = nil
 	n.free = append(n.free, lSeid)
 	return usars, nil
+}
+
+// [新增] 實作 ees.SessionProvider 介面
+// 讓 EES 可以獲取當前活躍 Session 的上下文 (RemoteSEID 和 URRIDs)
+func (n *LocalNode) GetSessionContexts() map[uint64]ees.SessionContext {
+	// 如果需要並發安全，建議在這裡加鎖 (n.sess 在運作中可能會變動)
+	// 但 MVP 若無並發刪除 Session 的高風險場景，可暫時不加
+
+	result := make(map[uint64]ees.SessionContext)
+
+	for _, sess := range n.sess {
+		if sess == nil {
+			continue
+		}
+
+		// 收集該 Session 下所有的 URR ID
+		var urrIDs []uint32
+		if sess.URRIDs != nil {
+			for urrID := range sess.URRIDs {
+				urrIDs = append(urrIDs, urrID)
+			}
+		}
+
+		// 只有當 Session 有 URR 時才需要監控 (或是根據需求決定是否包含空 Session)
+		if len(urrIDs) > 0 {
+			result[sess.LocalID] = ees.SessionContext{
+				RemoteSEID: sess.RemoteID,
+				URRIDs:     urrIDs,
+			}
+		}
+	}
+	return result
 }
