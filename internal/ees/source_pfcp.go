@@ -231,6 +231,15 @@ func (s *ActivePFCPSource) SnapshotNow() (map[SessionKey]Counters, error) {
 
 	// 3. 呼叫 Driver 執行批量查詢 (Netlink 交互)
 	reportsMap, err := s.driver.QueryMultiURR(queryMap)
+
+	for _, reports := range reportsMap {
+		for _, r := range reports {
+			// 強制印出所有 URR 的資訊，不管是不是 0
+			fmt.Printf("[DEBUG-EES] URR:%d UL:%d DL:%d\n",
+				r.URRID, r.VolumMeasure.UplinkVolume, r.VolumMeasure.DownlinkVolume)
+		}
+	}
+
 	if err != nil {
 		return nil, fmt.Errorf("active query failed: %w", err)
 	}
