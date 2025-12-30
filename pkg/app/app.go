@@ -2,8 +2,11 @@ package app
 
 import (
 	"context"
+	"os"
+	"os/signal"
 	"runtime/debug"
 	"sync"
+	"syscall"
 
 	"github.com/sirupsen/logrus"
 
@@ -136,6 +139,15 @@ func (u *UpfApp) Terminate() {
 }
 
 func (u *UpfApp) Run() error {
+	var cancel context.CancelFunc
+
+	u.ctx, cancel = context.WithCancel(context.Background())
+	defer cancel()
+
+	u.wg.Add(1)
+	// Go Routine is spawned here for listening for cancellation event on
+	// context
+	go u.listenShutdownEvent()
 	// ... (原有 context 設定) ...
 
 	var err error
@@ -208,4 +220,16 @@ func (u *UpfApp) Run() error {
 	logger.MainLog.Infoln("UPF started")
 
 	// ... (後續 Signal 處理保持不變)
+	// Wait for interrupt signal to gracefully shutdown
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	<-sigCh
+
+	// Receive the interrupt signal
+	logger.MainLog.Infof("Shutdown UPF ...")
+	// Notify each goroutine and wait them stopped
+	cancel()
+	u.WaitRoutineStopped()
+	logger.MainLog.Infof("UPF exited")
+	return nil
 }
