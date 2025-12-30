@@ -38,20 +38,20 @@ type PFCPSource struct {
 	staleAfter time.Duration
 }
 
-// ForwarderDriver 定義與底層轉發層 (如 gtp5g) 溝通的介面
-// 對應 internal/forwarder/driver.go 中的實作
+// ForwarderDriver defines the interface for communicating with the underlying forwarding layer (e.g., gtp5g)
+// Corresponds to the implementation in internal/forwarder/driver.go
 type ForwarderDriver interface {
 	QueryMultiURR(map[uint64][]uint32) (map[uint64][]report.USAReport, error)
 }
 
-// SessionProvider 定義獲取活躍 Session 資訊的介面
-// 對應 internal/pfcp/node.go 中 LocalNode 的實作
+// SessionProvider defines the interface for obtaining active Session information
+// Corresponds to the implementation of LocalNode in internal/pfcp/node.go
 type SessionProvider interface {
 	GetSessionContexts() map[uint64]SessionContext
 }
 
-// [實作 Source]
-// ActivePFCPSource 是一個無狀態的 Source，每次 SnapshotNow 都會主動向底層查詢最新數據。
+// [Implement Source]
+// ActivePFCPSource is a stateless Source that actively queries the underlying layer for the latest data on every SnapshotNow.
 type ActivePFCPSource struct {
 	driver          ForwarderDriver
 	sessionProvider SessionProvider

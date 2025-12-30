@@ -29,10 +29,10 @@ type Aggregator struct {
 	notifier          *Notifier
 	logger            *zap.Logger
 
-	// [新增] 狀態快取：用來儲存上一次的計數器數值，以便計算增量 (Delta)
-	// Key: SessionKey, Value: 上一次的 Counters
+	// [New] State cache: used to store the last counter values to calculate delta
+	// Key: SessionKey, Value: Last Counters
 	lastSnapshot map[SessionKey]Counters
-	// [新增] 記錄上一次 Snapshot 發生的時間
+	// [New] Record the time when the last Snapshot occurred
 	lastSnapshotTime time.Time
 }
 
@@ -51,9 +51,9 @@ func NewAggregator(
 		notifier:          notifier,
 		logger:            logger,
 
-		// 初始化 map
+		// Initialize map
 		lastSnapshot: make(map[SessionKey]Counters),
-		// 初始化時間為現在，避免第一次回報的時間區間過大
+		// Initialize time to now to avoid excessively large interval for the first report
 		lastSnapshotTime: time.Now(),
 	}
 }
@@ -85,11 +85,11 @@ func (aggregator *Aggregator) Run(parentContext context.Context) {
 // refreshes snapshots, and cleans unused session keys.
 // Returns number of notifications attempted (sum over all subscriptions) and any error.
 func (aggregator *Aggregator) TickOnce(ctx context.Context) (int, error) {
-	// 1. 記錄當下時間 (作為本次區間的 EndTime)
+	// 1. Record current time (as EndTime for this interval)
 	now := time.Now()
 
-	// 2. 主動拉取最新數據 (Active Pull)
-	// 使用 sourceProvider 調用
+	// 2. Active Pull latest data
+	// Call using sourceProvider
 	currentSnapshot, err := aggregator.sourceProvider.SnapshotNow()
 	if err != nil {
 		aggregator.logger.Warn("ees snapshot failed", zap.Error(err))
@@ -98,8 +98,8 @@ func (aggregator *Aggregator) TickOnce(ctx context.Context) (int, error) {
 
 	totalNotifications := 0
 
-	// 3. 遍歷所有訂閱，計算增量並發送通知
-	// [修正 3] 直接使用現有的 AllSubscriptions() 方法，不需新增 Range()
+	// 3. Iterate over all subscriptions, calculate delta and send notifications
+	// [Fix 3] Use existing AllSubscriptions() method directly, no need to add Range()
 	subscriptions := aggregator.subscriptionStore.AllSubscriptions()
 
 	for _, subscription := range subscriptions {
@@ -114,13 +114,13 @@ func (aggregator *Aggregator) TickOnce(ctx context.Context) (int, error) {
 			continue
 		}
 
-		// [核心修正] 計算邏輯重寫：使用 LastSnapshot 來計算 Delta
+		// [Core Fix] Rewrite calculation logic: Use LastSnapshot to calculate Delta
 		var usageMeasuresList []UsageMeasures
 
 		for key, currentCounters := range currentSnapshot {
-			// TODO: 未來在此加入 target 過濾邏輯 (如: if key.UEIP != sub.Filter.UEIP { continue })
+			// TODO: Add target filtering logic here in the future (e.g., if key.UEIP != sub.Filter.UEIP { continue })
 
-			// 嘗試從歷史紀錄中獲取上一次的數值
+			// Try to get the last values from history
 			lastCounters, found := aggregator.lastSnapshot[key]
 
 			var deltaUL, deltaDL uint64
@@ -128,19 +128,19 @@ func (aggregator *Aggregator) TickOnce(ctx context.Context) (int, error) {
 			var startTime time.Time
 
 			if !found {
-				// Case A: 新的 Session (第一次看到)
-				// 第一次回報總量作為基準
+				// Case A: New Session (seen for the first time)
+				// Use total amount as baseline for the first report
 				deltaUL = currentCounters.ULBytes
 				deltaDL = currentCounters.DLBytes
 				deltaULPkt = currentCounters.ULPackets
 				deltaDLPkt = currentCounters.DLPackets
 
-				// StartTime 設為該 Session 在 Kernel 中的建立時間
+				// Set StartTime to the creation time of the Session in Kernel
 				startTime = currentCounters.StartTime
 			} else {
-				// Case B: 舊的 Session (計算差值)
+				// Case B: Old Session (calculate difference)
 
-				// 防止 Counter Overflow 或 Kernel 重啟
+				// Prevent Counter Overflow or Kernel restart
 				if currentCounters.ULBytes >= lastCounters.ULBytes {
 					deltaUL = currentCounters.ULBytes - lastCounters.ULBytes
 				} else {
@@ -165,11 +165,11 @@ func (aggregator *Aggregator) TickOnce(ctx context.Context) (int, error) {
 					deltaDLPkt = currentCounters.DLPackets
 				}
 
-				// [關鍵修正] StartTime 應該是 "上一次 Snapshot 的時間"
+				// [Critical Fix] StartTime should be "Time of the last Snapshot"
 				startTime = aggregator.lastSnapshotTime
 			}
 
-			// 組裝回報項目
+			// Assemble report item
 			usage := UsageMeasures{
 				Key:            key,
 				ULBytesDelta:   deltaUL,
@@ -180,7 +180,7 @@ func (aggregator *Aggregator) TickOnce(ctx context.Context) (int, error) {
 				EndTime:        now,
 			}
 
-			// 計算吞吐量 (使用新的 computeThroughputIfPossible 邏輯，或直接在此計算)
+			// Calculate throughput (use new computeThroughputIfPossible logic, or calculate directly here)
 			durationSeconds := usage.EndTime.Sub(usage.StartTime).Seconds()
 			if durationSeconds > 0 {
 				usage.ULThroughputBps = (float64(usage.ULBytesDelta) * 8.0) / durationSeconds
@@ -231,7 +231,7 @@ func (aggregator *Aggregator) TickOnce(ctx context.Context) (int, error) {
 		}
 	}
 
-	// 4. 更新狀態：將 Current 變為 Last，為下一次 Tick 做準備
+	// 4. Update state: Change Current to Last, prepare for the next Tick
 	aggregator.lastSnapshot = currentSnapshot
 	aggregator.lastSnapshotTime = now
 

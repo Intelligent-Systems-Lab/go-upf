@@ -691,11 +691,11 @@ func (n *LocalNode) DeleteSess(lSeid uint64) ([]report.USAReport, error) {
 	return usars, nil
 }
 
-// [新增] 實作 ees.SessionProvider 介面
-// 讓 EES 可以獲取當前活躍 Session 的上下文 (RemoteSEID 和 URRIDs)
+// [New] Implement ees.SessionProvider interface
+// Allow EES to obtain the context of active Sessions (RemoteSEID and URRIDs)
 func (n *LocalNode) GetSessionContexts() map[uint64]ees.SessionContext {
-	// 如果需要並發安全，建議在這裡加鎖 (n.sess 在運作中可能會變動)
-	// 但 MVP 若無並發刪除 Session 的高風險場景，可暫時不加
+	// If concurrency safety is needed, it is recommended to add a lock here (n.sess may change during operation)
+	// But for MVP, if there is no high-risk scenario of concurrent Session deletion, it can be omitted temporarily
 
 	result := make(map[uint64]ees.SessionContext)
 
@@ -704,7 +704,7 @@ func (n *LocalNode) GetSessionContexts() map[uint64]ees.SessionContext {
 			continue
 		}
 
-		// 收集該 Session 下所有的 URR ID
+		// Collect all URR IDs under this Session
 		var urrIDs []uint32
 		if sess.URRIDs != nil {
 			for urrID := range sess.URRIDs {
@@ -712,7 +712,7 @@ func (n *LocalNode) GetSessionContexts() map[uint64]ees.SessionContext {
 			}
 		}
 
-		// 只有當 Session 有 URR 時才需要監控 (或是根據需求決定是否包含空 Session)
+		// Only monitor when Session has URR (or decide whether to include empty Session based on requirements)
 		if len(urrIDs) > 0 {
 			result[sess.LocalID] = ees.SessionContext{
 				RemoteSEID: sess.RemoteID,
