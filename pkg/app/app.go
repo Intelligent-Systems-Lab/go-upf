@@ -15,10 +15,10 @@ import (
 	"github.com/free5gc/go-upf/internal/pfcp"
 	"github.com/free5gc/go-upf/pkg/factory"
 
-	"time" // [新增]
+	"time" // [new]
 
-	"github.com/free5gc/go-upf/internal/ees" // [新增]
-	"go.uber.org/zap"                        // [新增]
+	"github.com/free5gc/go-upf/internal/ees" // [new]
+	"go.uber.org/zap"                        // [new]
 )
 
 type UpfApp struct {
@@ -148,7 +148,7 @@ func (u *UpfApp) Run() error {
 	// Go Routine is spawned here for listening for cancellation event on
 	// context
 	go u.listenShutdownEvent()
-	// ... (原有 context 設定) ...
+	// ... (Original context setting) ...
 
 	var err error
 	u.driver, err = forwarder.NewDriver(&u.wg, u.cfg)
@@ -161,26 +161,26 @@ func (u *UpfApp) Run() error {
 	u.pfcpServer.Start(&u.wg)
 
 	// =========================================================================
-	// [新增] EES 初始化邏輯 (遷移自 main.go，並改為依賴注入)
+	// [New] EES initialization logic (migrated from main.go and changed to dependency injection)
 	// =========================================================================
 	if u.cfg.EES != nil && u.cfg.EES.Enabled {
 		logger.MainLog.Infoln("Starting EES Module...")
 
-		// 1. 建立 Logger
-		eesLogger, _ := zap.NewDevelopment() // 簡單處理 error
+		// 1. Create Logger
+		eesLogger, _ := zap.NewDevelopment() // Simple error handling
 
-		// 2. 建立 Active Source (依賴注入核心)
-		// 這裡注入了 u.driver (ForwarderDriver) 和 u.pfcpServer.LocalNode (SessionProvider)
-		// 注意：需確保 pfcpServer 暴露了 LocalNode，或是透過 Getter 獲取
-		// 假設 pfcpServer 結構中 lnode 是 public (Lnode) 或有 GetLocalNode() 方法
-		// 由於你的 pfcpServer 定義 lnode 是小寫 (private) ，
-		// 你可能需要先去 internal/pfcp/pfcp.go 增加一個 GetLocalNode() 方法，
-		// 或者暫時將 lnode 改為 Lnode (Public)。
-		// 這裡假設你加了一個 GetLocalNode()：
+		// 2. Create Active Source (Core dependency injection)
+		// Injected u.driver (ForwarderDriver) and u.pfcpServer.LocalNode (SessionProvider) here
+		// Note: Ensure pfcpServer exposes LocalNode, or access via Getter
+		// Assuming lnode in pfcpServer struct is public (Lnode) or has GetLocalNode() method
+		// Since your pfcpServer defines lnode as lowercase (private),
+		// You may need to add a GetLocalNode() method in internal/pfcp/pfcp.go first,
+		// Or temporarily change lnode to Lnode (Public).
+		// Assuming you added a GetLocalNode():
 
 		pfcpSource := ees.NewActivePFCPSource(u.driver, u.pfcpServer.GetLocalNode())
 
-		// 3. 建立 Store / Notifier / Aggregator
+		// 3. Create Store / Notifier / Aggregator
 		subscriptionStore := ees.NewSubscriptionStore("")
 		notifier := ees.NewNotifier(eesLogger)
 
@@ -190,15 +190,15 @@ func (u *UpfApp) Run() error {
 		}
 
 		aggregator := ees.NewAggregator(
-			pfcpSource, // 傳入新的 Active Source
+			pfcpSource, // Pass in the new Active Source
 			subscriptionStore,
 			time.Duration(period)*time.Second,
 			notifier,
 			eesLogger,
 		)
 
-		// 4. 啟動 Aggregator 和 API Server
-		// 注意：這裡應該使用 u.wg 來管理 goroutine，或使用獨立的 context
+		// 4. Start Aggregator and API Server
+		// Note: Should use u.wg to manage goroutine here, or use independent context
 		go aggregator.Run(u.ctx)
 
 		listenAddr := u.cfg.EES.ListenAddr
@@ -219,7 +219,7 @@ func (u *UpfApp) Run() error {
 
 	logger.MainLog.Infoln("UPF started")
 
-	// ... (後續 Signal 處理保持不變)
+	// ... (Subsequent Signal handling remains unchanged)
 	// Wait for interrupt signal to gracefully shutdown
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
