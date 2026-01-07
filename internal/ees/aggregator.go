@@ -207,7 +207,7 @@ func (aggregator *Aggregator) TickOnce(ctx context.Context) (int, error) {
 					)
 				}
 			}
-			// OnDemand 處理完後轉為 Periodic (既有邏輯)，或者直接移除
+			// Switch to Periodic after OnDemand processing (existing logic), or remove directly
 			subscription.Mode = ModePeriodic
 			continue
 		}

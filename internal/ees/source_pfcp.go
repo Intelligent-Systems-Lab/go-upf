@@ -198,7 +198,7 @@ func (pfcpSource *PFCPSource) PruneStale() (removedCount int) {
 	return removedCount
 }
 
-// NewActivePFCPSource 建構子
+// NewActivePFCPSource constructor
 func NewActivePFCPSource(driver ForwarderDriver, provider SessionProvider) *ActivePFCPSource {
 	return &ActivePFCPSource{
 		driver:          driver,
@@ -206,18 +206,18 @@ func NewActivePFCPSource(driver ForwarderDriver, provider SessionProvider) *Acti
 	}
 }
 
-// SnapshotNow 執行主動查詢 (Active Pull)
-// 1. 從 Provider 獲取所有 Session 上下文
-// 2. 向 Driver 批量查詢 URR 數據
-// 3. 聚合數據並回傳
+// SnapshotNow executes active query (Active Pull)
+// 1. Get all Session contexts from Provider
+// 2. Batch query URR data from Driver
+// 3. Aggregate data and return
 func (s *ActivePFCPSource) SnapshotNow() (map[SessionKey]Counters, error) {
-	// 1. 獲取當前活躍的 Session 列表
+	// 1. Get current active Session list
 	sessionCtxs := s.sessionProvider.GetSessionContexts()
 	if len(sessionCtxs) == 0 {
 		return nil, nil
 	}
 
-	// 2. 準備批量查詢的參數 (map[LocalSEID] -> []URRID)
+	// 2. Prepare batch query parameters (map[LocalSEID] -> []URRID)
 	queryMap := make(map[uint64][]uint32, len(sessionCtxs))
 	for lSeid, ctx := range sessionCtxs {
 		if len(ctx.URRIDs) > 0 {
@@ -229,12 +229,12 @@ func (s *ActivePFCPSource) SnapshotNow() (map[SessionKey]Counters, error) {
 		return nil, nil
 	}
 
-	// 3. 呼叫 Driver 執行批量查詢 (Netlink 交互)
+	// 3. Call Driver to execute batch query (Netlink interaction)
 	reportsMap, err := s.driver.QueryMultiURR(queryMap)
 
 	for _, reports := range reportsMap {
 		for _, r := range reports {
-			// 強制印出所有 URR 的資訊，不管是不是 0
+			// Force print all URR info, even if it is 0
 			fmt.Printf("[DEBUG-EES] URR:%d UL:%d DL:%d\n",
 				r.URRID, r.VolumMeasure.UplinkVolume, r.VolumMeasure.DownlinkVolume)
 		}
@@ -244,26 +244,26 @@ func (s *ActivePFCPSource) SnapshotNow() (map[SessionKey]Counters, error) {
 		return nil, fmt.Errorf("active query failed: %w", err)
 	}
 
-	// 4. 轉換並聚合結果
+	// 4. Convert and aggregate results
 	result := make(map[SessionKey]Counters, len(reportsMap))
 
 	for lSeid, reports := range reportsMap {
 		ctx, ok := sessionCtxs[lSeid]
 		if !ok {
-			// 在查詢期間 Session 可能剛好被刪除，忽略此結果
+			// Session might be deleted during query, ignore this result
 			continue
 		}
 
-		// 聚合該 Session 下多個 URR 的數據
+		// Aggregate data from multiple URRs under this Session
 		var merged Counters
 		var hasFresh bool
 
 		for _, r := range reports {
-			// 如果需要過濾 Stale 數據 (例如 Kernel 很久沒更新)，可以在這裡判斷 r.EndTime
-			// 但通常 Active Query 取得的都是 Kernel 當下的數值
+			// If need to filter Stale data (e.g. Kernel not updated for a long time), check r.EndTime here
+			// However, Active Query usually gets the current value from Kernel
 
 			if !hasFresh {
-				// 第一筆數據，直接初始化
+				// First data, initialize directly
 				merged = Counters{
 					ULBytes:   r.VolumMeasure.UplinkVolume,
 					DLBytes:   r.VolumMeasure.DownlinkVolume,
@@ -274,13 +274,13 @@ func (s *ActivePFCPSource) SnapshotNow() (map[SessionKey]Counters, error) {
 				}
 				hasFresh = true
 			} else {
-				// 後續數據，進行累加
+				// Subsequent data, accumulate
 				merged.ULBytes += r.VolumMeasure.UplinkVolume
 				merged.DLBytes += r.VolumMeasure.DownlinkVolume
 				merged.ULPackets += r.VolumMeasure.UplinkPktNum
 				merged.DLPackets += r.VolumMeasure.DownlinkPktNum
 
-				// 時間區間取聯集 (Start 取最早，End 取最晚)
+				// Time interval union (Start takes earliest, End takes latest)
 				if !r.StartTime.IsZero() && r.StartTime.Before(merged.StartTime) {
 					merged.StartTime = r.StartTime
 				}
