@@ -13,7 +13,34 @@ const (
 	// EventUserDataUsageMeasures reports per-interval usage deltas (bytes/packets, UL/DL),
 	// optionally with throughputs derived from (delta bytes) / (EndTime - StartTime).
 	EventUserDataUsageMeasures EventType = "USER_DATA_USAGE_MEASURES"
+	// EventUserDataUsageTrends reports throughput statistics.
+	EventUserDataUsageTrends EventType = "USER_DATA_USAGE_TRENDS"
 )
+
+// UserDataUsageMeasurements represents VOLUME-based measurements (Measures event).
+type UserDataUsageMeasurements struct {
+	VolumeMeasurement VolumeMeasurement `json:"volumeMeasurement"`
+	// Time window
+	StartTime time.Time `json:"startTime,omitempty"`
+	EndTime   time.Time `json:"endTime,omitempty"`
+}
+
+type VolumeMeasurement struct {
+	TotalVolume     uint64 `json:"totalVolume,omitempty"`
+	UplinkVolume    uint64 `json:"uplinkVolume,omitempty"`
+	DownlinkVolume  uint64 `json:"downlinkVolume,omitempty"`
+	TotalPackets    uint64 `json:"totalPackets,omitempty"`
+	UplinkPackets   uint64 `json:"uplinkPackets,omitempty"`
+	DownlinkPackets uint64 `json:"downlinkPackets,omitempty"`
+}
+
+// ThroughputStatisticMeasurement represents TRENDS-based statistics.
+type ThroughputStatisticMeasurement struct {
+	UlAverageThroughput float64   `json:"ulAverageThroughput,omitempty"` // bps
+	DlAverageThroughput float64   `json:"dlAverageThroughput,omitempty"` // bps
+	StartTime           time.Time `json:"startTime,omitempty"`
+	EndTime             time.Time `json:"endTime,omitempty"`
+}
 
 // Granularity controls the level of aggregation for the event.
 // MVP only: perPduSession.
@@ -97,6 +124,9 @@ type Subscription struct {
 
 	CreatedAt  time.Time
 	LastNotify time.Time
+
+	// ShadowURRID is the internal URR ID allocated for this subscription.
+	ShadowURRID uint32
 
 	// Snapshots keeps the last seen per-session counters for delta computation.
 	// Key: SessionKey (LocalSEID, RemoteSEID)
