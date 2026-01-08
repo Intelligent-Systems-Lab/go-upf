@@ -61,6 +61,12 @@ func (store *SubscriptionStore) CreateSubscription(newSubscription *Subscription
 	if newSubscription.PeriodSec <= 0 {
 		return "", fmt.Errorf("%w: PeriodSec must be > 0", ErrInvalidSubscription)
 	}
+	if newSubscription.NfID == "" {
+		return "", fmt.Errorf("%w: missing NfID", ErrInvalidSubscription)
+	}
+	if newSubscription.NotifyCorrelationID == "" {
+		return "", fmt.Errorf("%w: missing NotifyCorrelationID", ErrInvalidSubscription)
+	}
 
 	subscriptionID := store.generateSubscriptionID()
 	now := time.Now()
