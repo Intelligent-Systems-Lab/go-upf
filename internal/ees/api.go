@@ -22,6 +22,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/wmnsk/go-pfcp/ie"
 	"go.uber.org/zap"
 )
 
@@ -29,14 +30,27 @@ import (
 type Server struct {
 	subscriptionStore *SubscriptionStore
 	aggregator        *Aggregator
+	provisioner       *Provisioner
+	sessionProvider   SessionProvider
+	idManager         *IDManager
 	logger            *zap.Logger
 }
 
 // NewServer constructs a Server.
-func NewServer(store *SubscriptionStore, aggregator *Aggregator, logger *zap.Logger) *Server {
+func NewServer(
+	store *SubscriptionStore,
+	aggregator *Aggregator,
+	provisioner *Provisioner,
+	sessionProvider SessionProvider,
+	idManager *IDManager,
+	logger *zap.Logger,
+) *Server {
 	return &Server{
 		subscriptionStore: store,
 		aggregator:        aggregator,
+		provisioner:       provisioner,
+		sessionProvider:   sessionProvider,
+		idManager:         idManager,
 		logger:            logger,
 	}
 }
@@ -109,8 +123,22 @@ func (server *Server) handleCreateSubscription(w http.ResponseWriter, r *http.Re
 		return
 	}
 
+	// [New] Allocate Shadow URR ID
+	if server.idManager != nil {
+		shadowID, err := server.idManager.Allocate()
+		if err != nil {
+			http.Error(w, fmt.Sprintf("allocate shadow id failed: %v", err), http.StatusInternalServerError)
+			return
+		}
+		subscriptionCandidate.ShadowURRID = shadowID
+	}
+
 	subscriptionID, err := server.subscriptionStore.CreateSubscription(subscriptionCandidate)
 	if err != nil {
+		// Rollback ID if create failed
+		if server.idManager != nil {
+			server.idManager.Release(subscriptionCandidate.ShadowURRID)
+		}
 		status := http.StatusInternalServerError
 		if errors.Is(err, ErrInvalidSubscription) {
 			status = http.StatusBadRequest
@@ -119,9 +147,16 @@ func (server *Server) handleCreateSubscription(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	// If ON_DEMAND, trigger one immediate tick (best-effort).
+	// Hybrid Logic: Path A (Immediate/Pull) and Path B (Periodic/Push)
+
+	// Path A: Immediate (ModeOnDemand or logic implies immediate report)
+	// If Trigger=ONE_TIME, it's OnDemand.
 	if subscriptionCandidate.Mode == ModeOnDemand {
 		go func() {
+			// Trigger One-Time Pull (using existing polling logic for now, querying standard URRs?)
+			// Note: If we want to query Shadow URR, we must create it first.
+			// But OnDemand usually means "current status".
+			// We use classic Aggregator Tick (Pull) for this.
 			if _, tickErr := server.aggregator.TickOnce(context.Background()); tickErr != nil {
 				server.logger.Warn("ees on-demand immediate tick failed",
 					zap.String("subscriptionId", subscriptionID),
@@ -131,8 +166,16 @@ func (server *Server) handleCreateSubscription(w http.ResponseWriter, r *http.Re
 		}()
 	}
 
+	// Path B: Periodic (Push via Kernel Shadow URR)
+	if subscriptionCandidate.Mode == ModePeriodic {
+		go func() {
+			server.provisionURR(subscriptionCandidate)
+		}()
+	}
+
 	server.logger.Info("ees subscription created",
 		zap.String("subscriptionId", subscriptionID),
+		zap.Uint32("shadowUrrId", subscriptionCandidate.ShadowURRID), // Log Shadow ID
 		zap.String("nfId", subscriptionCandidate.NfID),
 		zap.String("notifUri", subscriptionCandidate.NotifURI),
 		zap.String("event", string(subscriptionCandidate.Event)),
@@ -153,6 +196,83 @@ func (server *Server) handleCreateSubscription(w http.ResponseWriter, r *http.Re
 	}
 }
 
+func (server *Server) provisionURR(sub *Subscription) {
+	if server.provisioner == nil || server.sessionProvider == nil {
+		return
+	}
+
+	if sub.Target.AnyUE {
+		sessions := server.sessionProvider.GetSessionContexts()
+		server.logger.Info("ees provisioning URR to existing sessions",
+			zap.Int("count", len(sessions)),
+			zap.Uint32("shadowID", sub.ShadowURRID),
+		)
+		for seid, session := range sessions {
+			// 1. Create/Push the EES Shadow URR (Counter)
+			err := server.provisioner.PushURRToKernel(
+				seid,
+				sub.ShadowURRID,
+				sub.Event,
+				sub.Mode,
+				sub.PeriodSec,
+			)
+			if err != nil {
+				server.logger.Warn("ees provisioning failed for session",
+					zap.Uint64("seid", seid),
+					zap.Error(err),
+				)
+				continue
+			}
+
+			// 2. Bind this new URR to existing PDRs
+			// In PFCP, a URR only counts if a PDR points to it.
+			// We must update relevant PDRs to include the new URR ID.
+			for _, pdr := range session.PDRs {
+				// Avoid duplicates
+				hasShadow := false
+				for _, uid := range pdr.URRIDs {
+					if uid == sub.ShadowURRID {
+						hasShadow = true
+						break
+					}
+				}
+				if hasShadow {
+					continue
+				}
+
+				// Construct new URR list (Old + Shadow)
+				newURRIDs := make([]uint32, len(pdr.URRIDs)+1)
+				copy(newURRIDs, pdr.URRIDs)
+				newURRIDs[len(pdr.URRIDs)] = sub.ShadowURRID
+
+				// Construct UpdatePDR IE
+				// We only send PDR ID and the new list of URR IDs.
+				// Based on TS 29.244, other fields remain unchanged if not present.
+				ies := []*ie.IE{
+					ie.NewPDRID(pdr.PDRID),
+				}
+				for _, uid := range newURRIDs {
+					ies = append(ies, ie.NewURRID(uid))
+				}
+				updatePdrIE := ie.NewUpdatePDR(ies...)
+
+				// Push to Kernel
+				if err := server.provisioner.UpdatePDRToKernel(seid, updatePdrIE); err != nil {
+					server.logger.Warn("ees linking PDR to URR failed",
+						zap.Uint64("seid", seid),
+						zap.Uint16("pdrId", pdr.PDRID),
+						zap.Error(err),
+					)
+				} else {
+					// Update local Session Context to reflect the change
+					// This ensures future operations know about the link
+					pdr.URRIDs = newURRIDs
+				}
+			}
+		}
+	}
+}
+
 // handleDeleteSubscriptionByID handles DELETE /nupf-ee/v1/ee-subscriptions/{id}
 func (server *Server) handleDeleteSubscriptionByID(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodDelete {
@@ -160,7 +280,6 @@ func (server *Server) handleDeleteSubscriptionByID(w http.ResponseWriter, r *htt
 		return
 	}
 
-	// Expect path like /nupf-ee/v1/ee-subscriptions/{id}
 	path := strings.TrimPrefix(r.URL.Path, "/nupf-ee/v1/ee-subscriptions/")
 	if path == "" || strings.Contains(path, "/") {
 		http.Error(w, "invalid subscription id in path", http.StatusBadRequest)
@@ -168,13 +287,29 @@ func (server *Server) handleDeleteSubscriptionByID(w http.ResponseWriter, r *htt
 	}
 	subscriptionID := path
 
-	if err := server.subscriptionStore.DeleteSubscription(subscriptionID); err != nil {
-		if errors.Is(err, ErrSubscriptionNotFound) {
-			http.Error(w, "subscription not found", http.StatusNotFound)
-			return
-		}
-		http.Error(w, fmt.Sprintf("delete subscription failed: %v", err), http.StatusInternalServerError)
+	// Get subscription to find Shadow ID
+	sub, found := server.subscriptionStore.GetSubscription(subscriptionID)
+	if !found {
+		http.Error(w, "subscription not found", http.StatusNotFound)
 		return
+	}
+
+	// Release ID
+	if server.idManager != nil {
+		server.idManager.Release(sub.ShadowURRID)
+	}
+
+	// Remove URR from Kernel (Best Effort)
+	if server.provisioner != nil && server.sessionProvider != nil && sub.Target.AnyUE {
+		sessions := server.sessionProvider.GetSessionContexts()
+		for seid := range sessions {
+			_ = server.provisioner.RemoveURRFromKernel(seid, sub.ShadowURRID)
+		}
+	}
+
+	if err := server.subscriptionStore.DeleteSubscription(subscriptionID); err != nil {
+		// Log error but we already cleaned up resources roughly
+		server.logger.Error("delete subscription store failed", zap.Error(err))
 	}
 
 	server.logger.Info("ees subscription deleted", zap.String("subscriptionId", subscriptionID))

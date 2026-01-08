@@ -157,7 +157,11 @@ func (u *UpfApp) Run() error {
 	}
 
 	u.pfcpServer = pfcp.NewPfcpServer(u.cfg, u.driver)
-	u.driver.HandleReport(u.pfcpServer)
+
+	// [New] Dispatcher wiring
+	reportDispatcher := NewDispatcher(u.pfcpServer)
+	u.driver.HandleReport(reportDispatcher)
+
 	u.pfcpServer.Start(&u.wg)
 
 	// =========================================================================
@@ -197,15 +201,26 @@ func (u *UpfApp) Run() error {
 			eesLogger,
 		)
 
-		// 4. Start Aggregator and API Server
-		// Note: Should use u.wg to manage goroutine here, or use independent context
+		// 4. Register EES Handler to Dispatcher
+		eesHandler := ees.NewHandler(aggregator, eesLogger)
+		reportDispatcher.RegisterEESHandler(eesHandler)
+
+		// 5. Start Aggregator and API Server
+		// Note: Aggregator still runs for Periodic Polling (if used) or just state maintenance.
+		// If purely Push, Run() might be empty, but we keep it for now.
 		go aggregator.Run(u.ctx)
+
+		// [New] Provisioner
+		provisioner := ees.NewProvisioner(u.driver)
+		// We also need session provider for "Any UE" broadcast provisioning
+		sessionProvider := u.pfcpServer.GetLocalNode()
+		idManager := ees.NewIDManager()
 
 		listenAddr := u.cfg.EES.ListenAddr
 		if listenAddr == "" {
 			listenAddr = ":8088"
 		}
-		apiServer := ees.NewServer(subscriptionStore, aggregator, eesLogger)
+		apiServer := ees.NewServer(subscriptionStore, aggregator, provisioner, sessionProvider, idManager, eesLogger)
 
 		go func() {
 			if err := apiServer.Serve(listenAddr); err != nil {
