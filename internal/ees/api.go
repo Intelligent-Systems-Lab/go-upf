@@ -64,16 +64,24 @@ func (server *Server) Serve(listenAddress string) error {
 // ----- Request/Response models -----
 
 type createSubscriptionRequest struct {
-	NotifURI    string `json:"notifUri"`
-	Event       string `json:"event"`
-	Granularity string `json:"granularity"`
-	Mode        string `json:"mode"`
-	PeriodSec   int    `json:"periodSec"`
+	NfID                string       `json:"nfId"`
+	EventList           []UpfEvent   `json:"eventList"`
+	EventNotifyURI      string       `json:"eventNotifyUri"`
+	NotifyCorrelationID string       `json:"notifyCorrelationId"`
+	EventReportingMode  UpfEventMode `json:"eventReportingMode"`
 
-	// MVP: only AnyUE supported; keep the field for future extension.
-	Target struct {
-		AnyUE bool `json:"anyUe"`
-	} `json:"target"`
+	// Targeting: choose one
+	UeIPAddress string `json:"ueIpAddress,omitempty"`
+	AnyUE       bool   `json:"anyUe,omitempty"`
+}
+
+type UpfEvent struct {
+	Type string `json:"type"`
+}
+
+type UpfEventMode struct {
+	Trigger      string `json:"trigger"`                // "PERIODIC" | "ONE_TIME"
+	ReportPeriod int    `json:"reportPeriod,omitempty"` // Seconds
 }
 
 type createSubscriptionResponse struct {
@@ -125,12 +133,14 @@ func (server *Server) handleCreateSubscription(w http.ResponseWriter, r *http.Re
 
 	server.logger.Info("ees subscription created",
 		zap.String("subscriptionId", subscriptionID),
+		zap.String("nfId", subscriptionCandidate.NfID),
 		zap.String("notifUri", subscriptionCandidate.NotifURI),
 		zap.String("event", string(subscriptionCandidate.Event)),
-		zap.String("granularity", string(subscriptionCandidate.Granularity)),
 		zap.String("mode", string(subscriptionCandidate.Mode)),
+		zap.String("trigger", inboundRequest.EventReportingMode.Trigger),
 		zap.Int("periodSec", subscriptionCandidate.PeriodSec),
 		zap.Bool("targetAnyUE", subscriptionCandidate.Target.AnyUE),
+		zap.String("targetUeIP", subscriptionCandidate.Target.UeIPAddress),
 	)
 
 	w.Header().Set("Content-Type", "application/json")
@@ -142,6 +152,8 @@ func (server *Server) handleCreateSubscription(w http.ResponseWriter, r *http.Re
 		)
 	}
 }
+
+//請繼續減啥有關subscription的input以及現行的機制的符合規範
 
 // handleDeleteSubscriptionByID handles DELETE /nupf-ee/v1/ee-subscriptions/{id}
 func (server *Server) handleDeleteSubscriptionByID(w http.ResponseWriter, r *http.Request) {
@@ -174,56 +186,82 @@ func (server *Server) handleDeleteSubscriptionByID(w http.ResponseWriter, r *htt
 // ----- Helpers -----
 
 func (server *Server) validateAndBuildSubscription(req createSubscriptionRequest) (*Subscription, error) {
-	trimmedNotifURI := strings.TrimSpace(req.NotifURI)
-	if trimmedNotifURI == "" {
-		return nil, fmt.Errorf("missing field: notifUri")
+	// 1. Check Mandatory Attributes
+	if req.NfID == "" {
+		return nil, fmt.Errorf("missing mandatory attribute: nfId")
+	}
+	if req.EventNotifyURI == "" {
+		return nil, fmt.Errorf("missing mandatory attribute: eventNotifyUri")
+	}
+	if req.NotifyCorrelationID == "" {
+		return nil, fmt.Errorf("missing mandatory attribute: notifyCorrelationId")
 	}
 
-	// MVP: only USER_DATA_USAGE_MEASURES
-	if strings.ToUpper(req.Event) != string(EventUserDataUsageMeasures) {
-		return nil, fmt.Errorf("unsupported event: %s (only %s)", req.Event, EventUserDataUsageMeasures)
-	}
-
-	// MVP: only perPduSession
-	if req.Granularity != string(GranularityPerPduSession) {
-		return nil, fmt.Errorf("unsupported granularity: %s (only %s)", req.Granularity, GranularityPerPduSession)
-	}
-
-	// Mode validation
-	modeUpper := strings.ToUpper(req.Mode)
-	var chosenMode Mode
-	switch modeUpper {
-	case string(ModePeriodic):
-		chosenMode = ModePeriodic
-	case string(ModeOnDemand):
-		chosenMode = ModeOnDemand
-	case "":
-		// Default to PERIODIC if not specified.
-		chosenMode = ModePeriodic
-	default:
-		return nil, fmt.Errorf("unsupported mode: %s (use %s or %s)", req.Mode, ModePeriodic, ModeOnDemand)
-	}
-
-	periodSec := req.PeriodSec
-	if periodSec <= 0 {
-		// Fallback to aggregator's global period if request omitted or invalid.
-		periodSec = int(server.aggregator.reportPeriod / time.Second)
-		if periodSec <= 0 {
-			periodSec = 10 // ultimate fallback for MVP
+	// 2. Validate EventList (Must contain USER_DATA_USAGE_MEASURES)
+	// MVP: Only support exactly one event which matches USER_DATA_USAGE_MEASURES
+	foundSupportedEvent := false
+	for _, evt := range req.EventList {
+		if strings.ToUpper(evt.Type) == string(EventUserDataUsageMeasures) {
+			foundSupportedEvent = true
+		} else {
+			// To-do: Support other event types
+			return nil, fmt.Errorf("not supported yet: event type %s", evt.Type)
 		}
+	}
+	if !foundSupportedEvent {
+		return nil, fmt.Errorf("missing mandatory event type: must include %s", EventUserDataUsageMeasures)
+	}
+
+	// 3. Validate EventReportingMode
+	triggerUpper := strings.ToUpper(req.EventReportingMode.Trigger)
+	var chosenMode Mode
+	switch triggerUpper {
+	case "PERIODIC":
+		chosenMode = ModePeriodic
+	case "ONE_TIME":
+		chosenMode = ModeOnDemand
+	default:
+		// To-do: Support other triggers (e.g. THRESHOLD)
+		return nil, fmt.Errorf("not supported yet: trigger %s", req.EventReportingMode.Trigger)
+	}
+
+	periodSec := req.EventReportingMode.ReportPeriod
+	if periodSec <= 0 {
+		// Fallback for periodic if not specified
+		if chosenMode == ModePeriodic {
+			periodSec = int(server.aggregator.reportPeriod / time.Second)
+			if periodSec <= 0 {
+				periodSec = 10
+			}
+		}
+	}
+
+	// 4. Validate Targeting (Conditional Attributes)
+	// Must verify one of ueIpAddress or anyUe=true is present.
+	target := TargetScope{}
+	if req.AnyUE {
+		if req.UeIPAddress != "" {
+			return nil, fmt.Errorf("invalid targeting: cannot specify both anyUe and ueIpAddress")
+		}
+		target.AnyUE = true
+	} else if req.UeIPAddress != "" {
+		// To-do: Implement filtering logic in aggregator to support specific UE targeting
+		return nil, fmt.Errorf("not supported yet: targeting specific ueIpAddress")
+	} else {
+		return nil, fmt.Errorf("missing target: must specify either anyUe=true or provide ueIpAddress")
 	}
 
 	// Build subscription object.
 	newSubscription := &Subscription{
-		NotifURI:    trimmedNotifURI,
-		Event:       EventUserDataUsageMeasures,
-		Granularity: GranularityPerPduSession,
-		Mode:        chosenMode,
-		PeriodSec:   periodSec,
-		Target: TargetScope{
-			AnyUE: true, // MVP: force AnyUE=true
-		},
-		Snapshots: make(map[SessionKey]Counters),
+		NotifURI:            req.EventNotifyURI,
+		NotifyCorrelationID: req.NotifyCorrelationID,
+		NfID:                req.NfID,
+		Event:               EventUserDataUsageMeasures,
+		Granularity:         GranularityPerPduSession, // Fixed for MVP
+		Mode:                chosenMode,
+		PeriodSec:           periodSec,
+		Target:              target,
+		Snapshots:           make(map[SessionKey]Counters),
 	}
 
 	return newSubscription, nil

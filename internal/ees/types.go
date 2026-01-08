@@ -40,6 +40,8 @@ const (
 type TargetScope struct {
 	AnyUE bool
 	// Future: UEIP, SUPI, DNN, S-NSSAI, app filters...
+	// UeIPAddress allows targeting a specific UE by IP.
+	UeIPAddress string
 }
 
 // SessionKey uniquely identifies a session for reporting purposes.
@@ -83,13 +85,15 @@ type UsageMeasures struct {
 
 // Subscription holds the in-memory state for a single EES subscription.
 type Subscription struct {
-	ID          string
-	NotifURI    string
-	Event       EventType
-	Target      TargetScope
-	Granularity Granularity
-	Mode        Mode
-	PeriodSec   int
+	ID                  string
+	NotifURI            string
+	NotifyCorrelationID string // Added: Client-provided correlation ID
+	NfID                string // Added: NF Instance ID
+	Event               EventType
+	Target              TargetScope
+	Granularity         Granularity
+	Mode                Mode
+	PeriodSec           int
 
 	CreatedAt  time.Time
 	LastNotify time.Time
