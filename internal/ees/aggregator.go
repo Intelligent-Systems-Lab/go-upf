@@ -17,6 +17,7 @@ import (
 	"context"
 	"time"
 
+	"github.com/free5gc/go-upf/internal/report"
 	"go.uber.org/zap"
 )
 
@@ -236,6 +237,51 @@ func (aggregator *Aggregator) TickOnce(ctx context.Context) (int, error) {
 	aggregator.lastSnapshotTime = now
 
 	return totalNotifications, nil
+}
+
+// PushReport handles unsolicited reports (e.g. from Kernel via Handler).
+// This is the "Push" path.
+// PushReport handles unsolicited reports (e.g. from Kernel via Handler).
+// This is the "Push" path.
+func (aggregator *Aggregator) PushReport(sessRpt report.SessReport) {
+	for _, r := range sessRpt.Reports {
+		if r.Type() != report.USAR {
+			continue
+		}
+		usarep, ok := r.(report.USAReport)
+		if !ok {
+			continue
+		}
+
+		// Iterate subscriptions to see if this report is relevant
+		subscriptions := aggregator.subscriptionStore.AllSubscriptions()
+		for _, sub := range subscriptions {
+			// [New] Check Shadow URR ID match
+			if sub.ShadowURRID != usarep.URRID {
+				continue
+			}
+
+			// Build UsageMeasure
+			m := UsageMeasures{
+				Key: SessionKey{LocalSEID: sessRpt.SEID},
+				// Note: RemoteSEID is unknown here without lookup.
+				ULBytesDelta:   usarep.VolumMeasure.UplinkVolume,
+				DLBytesDelta:   usarep.VolumMeasure.DownlinkVolume,
+				ULPacketsDelta: usarep.VolumMeasure.UplinkPktNum,
+				DLPacketsDelta: usarep.VolumMeasure.DownlinkPktNum,
+				StartTime:      usarep.StartTime,
+				EndTime:        usarep.EndTime,
+			}
+
+			// Compute Throughput if Trends (or if Start/End time is present)
+			computeThroughputIfPossible(&m)
+
+			// Send immediately! (Push Model)
+			if err := aggregator.notifier.Notify(sub, []UsageMeasures{m}); err != nil {
+				aggregator.logger.Warn("ees push notify failed", zap.Error(err))
+			}
+		}
+	}
 }
 
 // computeUsageMeasuresFromCurrent uses the provider's current counters as-is (interval semantics)
