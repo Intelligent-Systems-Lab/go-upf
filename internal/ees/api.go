@@ -153,8 +153,6 @@ func (server *Server) handleCreateSubscription(w http.ResponseWriter, r *http.Re
 	}
 }
 
-//請繼續減啥有關subscription的input以及現行的機制的符合規範
-
 // handleDeleteSubscriptionByID handles DELETE /nupf-ee/v1/ee-subscriptions/{id}
 func (server *Server) handleDeleteSubscriptionByID(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodDelete {
@@ -186,7 +184,7 @@ func (server *Server) handleDeleteSubscriptionByID(w http.ResponseWriter, r *htt
 // ----- Helpers -----
 
 func (server *Server) validateAndBuildSubscription(req createSubscriptionRequest) (*Subscription, error) {
-	// 1. Check Mandatory Attributes
+	// 1. Check Top-level Mandatory Attributes
 	if req.NfID == "" {
 		return nil, fmt.Errorf("missing mandatory attribute: nfId")
 	}
@@ -197,10 +195,17 @@ func (server *Server) validateAndBuildSubscription(req createSubscriptionRequest
 		return nil, fmt.Errorf("missing mandatory attribute: notifyCorrelationId")
 	}
 
-	// 2. Validate EventList (Must contain USER_DATA_USAGE_MEASURES)
+	// 2. Validate EventList (Mandatory)
+	if len(req.EventList) == 0 {
+		return nil, fmt.Errorf("missing mandatory attribute: eventList cannot be empty")
+	}
+
 	// MVP: Only support exactly one event which matches USER_DATA_USAGE_MEASURES
 	foundSupportedEvent := false
 	for _, evt := range req.EventList {
+		if evt.Type == "" {
+			return nil, fmt.Errorf("missing mandatory attribute: eventList[].type")
+		}
 		if strings.ToUpper(evt.Type) == string(EventUserDataUsageMeasures) {
 			foundSupportedEvent = true
 		} else {
@@ -212,7 +217,11 @@ func (server *Server) validateAndBuildSubscription(req createSubscriptionRequest
 		return nil, fmt.Errorf("missing mandatory event type: must include %s", EventUserDataUsageMeasures)
 	}
 
-	// 3. Validate EventReportingMode
+	// 3. Validate EventReportingMode (Mandatory)
+	if req.EventReportingMode.Trigger == "" {
+		return nil, fmt.Errorf("missing mandatory attribute: eventReportingMode.trigger")
+	}
+
 	triggerUpper := strings.ToUpper(req.EventReportingMode.Trigger)
 	var chosenMode Mode
 	switch triggerUpper {
@@ -266,3 +275,23 @@ func (server *Server) validateAndBuildSubscription(req createSubscriptionRequest
 
 	return newSubscription, nil
 }
+
+/*
+Example Valid Subscription Payload (JSON):
+
+{
+  "nfId": "smf-01",
+  "eventList": [
+    {
+      "type": "USER_DATA_USAGE_MEASURES"
+    }
+  ],
+  "eventNotifyUri": "http://10.0.0.10:8080/namf-callback/v1/nupf-event",
+  "notifyCorrelationId": "corr-12345",
+  "eventReportingMode": {
+    "trigger": "PERIODIC",
+    "reportPeriod": 10
+  },
+  "anyUe": true
+}
+*/
