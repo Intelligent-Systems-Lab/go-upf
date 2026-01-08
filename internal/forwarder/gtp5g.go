@@ -461,6 +461,8 @@ func (g *Gtp5g) CreatePDR(lSeid uint64, req *ie.IE) error {
 	// roleAddrIpv4 = net.IPv4(34, 35, 36, 37)
 	// pdr.RoleAddrIpv4 = &roleAddrIpv4
 
+	g.log.Infof("[DEBUG-CHECK] CreatePDR ID: %d, Attributes: %+v", pdrid, attrs)
+
 	// TODO:
 	// Not in 3GPP spec, just used for buffering
 	attrs = append(attrs, nl.Attr{
@@ -1200,6 +1202,17 @@ func (g *Gtp5g) CreateURR(lSeid uint64, req *ie.IE) error {
 		}
 		g.ps.AddPeriodReportTimer(lSeid, urrid, measurePeriod)
 	}
+
+	targetVal := nl.AttrU64(3)
+
+	g.log.Infof("[FINAL-HACK] CreateURR ID: %d. Enforcing Measurement: %v (U64)", urrid, targetVal)
+
+	newAttr := nl.Attr{
+		Type:  gtp5gnl.URR_MEASUREMENT_METHOD,
+		Value: targetVal,
+	}
+
+	attrs = append([]nl.Attr{newAttr}, attrs...)
 
 	oid := gtp5gnl.OID{lSeid, uint64(urrid)}
 	return gtp5gnl.CreateURROID(g.client, g.link.link, oid, attrs)
