@@ -62,11 +62,12 @@ func NewNotifier(logger *zap.Logger) *Notifier {
 // notifyPayload is the JSON structure sent to subscriber endpoints.
 // Keep field names explicit for readability.
 type notifyPayload struct {
-	SubscriptionID string       `json:"subscriptionId"`
-	EventID        string       `json:"eventId"`
-	Granularity    string       `json:"granularity"`
-	Timestamp      time.Time    `json:"timestamp"`
-	Items          []notifyItem `json:"items"`
+	SubscriptionID      string       `json:"subscriptionId"`
+	NotifyCorrelationID string       `json:"notifyCorrelationId"`
+	EventID             string       `json:"eventId"`
+	Granularity         string       `json:"granularity"`
+	Timestamp           time.Time    `json:"timestamp"`
+	Items               []notifyItem `json:"items"`
 }
 
 // notifyItem represents a single per-session measurement record.
@@ -110,11 +111,12 @@ func (notifier *Notifier) Notify(subscription *Subscription, measures []UsageMea
 	}
 
 	payload := notifyPayload{
-		SubscriptionID: subscription.ID,
-		EventID:        string(subscription.Event),
-		Granularity:    string(subscription.Granularity),
-		Timestamp:      time.Now(),
-		Items:          items,
+		SubscriptionID:      subscription.ID,
+		NotifyCorrelationID: subscription.NotifyCorrelationID,
+		EventID:             string(subscription.Event),
+		Granularity:         string(subscription.Granularity),
+		Timestamp:           time.Now(),
+		Items:               items,
 	}
 
 	bodyBytes, err := json.Marshal(payload)
