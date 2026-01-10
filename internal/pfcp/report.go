@@ -105,6 +105,7 @@ func (s *PfcpServer) serveUSAReport(addr net.Addr, lSeid uint64, usars []report.
 		0,
 		ie.NewReportType(0, 0, 1, 0),
 	)
+	s.log.Infof("number of usars is : %d", len(usars))
 	for _, r := range usars {
 		urrInfo, ok := sess.URRIDs[r.URRID]
 		if !ok {
@@ -112,12 +113,13 @@ func (s *PfcpServer) serveUSAReport(addr net.Addr, lSeid uint64, usars []report.
 			continue
 		}
 		r.URSEQN = sess.URRSeq(r.URRID)
+
 		req.UsageReport = append(req.UsageReport,
 			ie.NewUsageReportWithinSessionReportRequest(
 				r.IEsWithinSessReportReq(
 					urrInfo.MeasureMethod, urrInfo.MeasureInformation)...,
 			))
-
+		s.log.Infof("serveUSAReport: SEID:%#x, Report:%+v, URRInfo:%+v", lSeid, r, urrInfo)
 	}
 
 	err = s.sendReqTo(req, addr)

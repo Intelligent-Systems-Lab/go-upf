@@ -141,7 +141,13 @@ type Source interface {
 	SnapshotNow() (map[SessionKey]Counters, error)
 }
 
+type PDRContext struct {
+	PDRID  uint16
+	URRIDs []uint32
+}
+
 type SessionContext struct {
 	RemoteSEID uint64
 	URRIDs     []uint32
+	PDRs       []*PDRContext
 }
