@@ -1132,6 +1132,7 @@ func (g *Gtp5g) CreateURR(lSeid uint64, req *ie.IE) error {
 			}
 		case ie.MeasurementMethod:
 			measureMethod, err = i.MeasurementMethod()
+			g.log.Infof("[DEBUG] CreateURR ID:%d Received Method:%d", urrid, measureMethod)
 			if err != nil {
 				return err
 			}

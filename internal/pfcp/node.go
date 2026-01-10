@@ -714,9 +714,25 @@ func (n *LocalNode) GetSessionContexts() map[uint64]ees.SessionContext {
 
 		// Only monitor when Session has URR (or decide whether to include empty Session based on requirements)
 		if len(urrIDs) > 0 {
+			// Populate PDRs
+			var pdrs []*ees.PDRContext
+
+			// Correct iteration over PDRIDs map
+			for pdrID, pdrInfo := range sess.PDRIDs {
+				var pdrURRIDs []uint32
+				for uid := range pdrInfo.RelatedURRIDs {
+					pdrURRIDs = append(pdrURRIDs, uid)
+				}
+				pdrs = append(pdrs, &ees.PDRContext{
+					PDRID:  pdrID,
+					URRIDs: pdrURRIDs,
+				})
+			}
+
 			result[sess.LocalID] = ees.SessionContext{
 				RemoteSEID: sess.RemoteID,
 				URRIDs:     urrIDs,
+				PDRs:       pdrs,
 			}
 		}
 	}
