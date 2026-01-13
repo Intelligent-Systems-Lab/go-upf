@@ -1204,19 +1204,24 @@ func (g *Gtp5g) CreateURR(lSeid uint64, req *ie.IE) error {
 		g.ps.AddPeriodReportTimer(lSeid, urrid, measurePeriod)
 	}
 
-	targetVal := nl.AttrU64(3)
+	targetVal := nl.AttrU8(3)
 
-	g.log.Infof("[FINAL-HACK] CreateURR ID: %d. Enforcing Measurement: %v (U64)", urrid, targetVal)
+	g.log.Infof("[FINAL-HACK] CreateURR ID: %d. Enforcing Measurement: %v (U8)", urrid, targetVal)
 
-	newAttr := nl.Attr{
+	// Filter out existing MEASUREMENT_METHOD attribute to avoid duplicates
+	filteredAttrs := make([]nl.Attr, 0, len(attrs))
+	for _, attr := range attrs {
+		if attr.Type != gtp5gnl.URR_MEASUREMENT_METHOD {
+			filteredAttrs = append(filteredAttrs, attr)
+		}
+	}
+	filteredAttrs = append(filteredAttrs, nl.Attr{
 		Type:  gtp5gnl.URR_MEASUREMENT_METHOD,
 		Value: targetVal,
-	}
-
-	attrs = append([]nl.Attr{newAttr}, attrs...)
+	})
 
 	oid := gtp5gnl.OID{lSeid, uint64(urrid)}
-	return gtp5gnl.CreateURROID(g.client, g.link.link, oid, attrs)
+	return gtp5gnl.CreateURROID(g.client, g.link.link, oid, filteredAttrs)
 }
 
 func (g *Gtp5g) UpdateURR(lSeid uint64, req *ie.IE) ([]report.USAReport, error) {
@@ -1523,7 +1528,34 @@ func (g *Gtp5g) queryURR(lSeid uint64, urrid uint32, ps bool) ([]report.USARepor
 }
 
 func (g *Gtp5g) QueryMultiURR(lSeidUrridsMap map[uint64][]uint32) (map[uint64][]report.USAReport, error) {
-	return g.queryMultiURR(lSeidUrridsMap, false)
+	// return g.queryMultiURR(lSeidUrridsMap, false)
+	return g.safeQueryMultiURR(lSeidUrridsMap, false)
+}
+
+func (g *Gtp5g) safeQueryMultiURR(lSeidUrridsMap map[uint64][]uint32, ps bool) (map[uint64][]report.USAReport, error) {
+	result := make(map[uint64][]report.USAReport)
+
+	for seid, urrIds := range lSeidUrridsMap {
+		for _, urrId := range urrIds {
+			usars, err := g.queryURR(seid, urrId, ps)
+			if err != nil {
+				// Log error but continue with other URRs, or return error?
+				// For robustness, we log and continue
+				g.log.Warnf("safeQueryMultiURR: failed to query URR %d for SEID %#x: %v", urrId, seid, err)
+				continue
+			}
+			if len(usars) > 0 {
+				g.log.Infof("[SAFE-QUERY] Got %d records for SEID:%#x URR:%d", len(usars), seid, urrId)
+				for i, u := range usars {
+					g.log.Infof("[SAFE-QUERY]   Record[%d]: Vol=%d UL=%d DL=%d", i, u.VolumMeasure.TotalVolume, u.VolumMeasure.UplinkVolume, u.VolumMeasure.DownlinkVolume)
+				}
+				result[seid] = append(result[seid], usars...)
+			} else {
+				g.log.Infof("[SAFE-QUERY] Zero records for SEID:%#x URR:%d", seid, urrId)
+			}
+		}
+	}
+	return result, nil
 }
 
 func (g *Gtp5g) queryMultiURR(lSeidUrridsMap map[uint64][]uint32, ps bool) (map[uint64][]report.USAReport, error) {

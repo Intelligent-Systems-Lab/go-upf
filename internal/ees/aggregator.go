@@ -15,46 +15,56 @@ package ees
 
 import (
 	"context"
+	"sync"
 	"time"
 
 	"github.com/free5gc/go-upf/internal/report"
 	"go.uber.org/zap"
 )
 
-// Aggregator periodically reads from Source, builds usage measures per subscription,
-// and sends notifications via Notifier.
+// Aggregator accumulates usage reports pushed from the kernel and periodically
+// sends notifications to subscribers. This is a pure Push model - no active polling.
 type Aggregator struct {
-	sourceProvider    Source
 	subscriptionStore *SubscriptionStore
 	reportPeriod      time.Duration
 	notifier          *Notifier
 	logger            *zap.Logger
 
-	// [New] State cache: used to store the last counter values to calculate delta
+	// [Push Mode] Mutex protects reportBuffer
+	mu sync.Mutex
+	// [Push Mode] Accumulated reports per subscription: Key=SubscriptionID
+	reportBuffer map[string][]UsageMeasures
+
+	sessionProvider SessionProvider // Added: to lookup UE IP
+
+	// [Legacy] State cache: kept for delta computation if needed
 	// Key: SessionKey, Value: Last Counters
 	lastSnapshot map[SessionKey]Counters
-	// [New] Record the time when the last Snapshot occurred
+	// [Legacy] Record the time when the last Snapshot occurred
 	lastSnapshotTime time.Time
 }
 
-// NewAggregator constructs an Aggregator.
+// NewAggregator constructs an Aggregator for pure Push mode.
+// Reports are accumulated via PushReport() and sent periodically by TickOnce().
 func NewAggregator(
-	sourceProvider Source,
 	subscriptionStore *SubscriptionStore,
 	reportPeriod time.Duration,
 	notifier *Notifier,
 	logger *zap.Logger,
+	sessionProvider SessionProvider,
 ) *Aggregator {
 	return &Aggregator{
-		sourceProvider:    sourceProvider,
 		subscriptionStore: subscriptionStore,
 		reportPeriod:      reportPeriod,
 		notifier:          notifier,
 		logger:            logger,
+		sessionProvider:   sessionProvider,
 
-		// Initialize map
-		lastSnapshot: make(map[SessionKey]Counters),
-		// Initialize time to now to avoid excessively large interval for the first report
+		// Initialize report buffer for Push mode
+		reportBuffer: make(map[string][]UsageMeasures),
+
+		// Initialize legacy snapshot maps (kept for potential future use)
+		lastSnapshot:     make(map[SessionKey]Counters),
 		lastSnapshotTime: time.Now(),
 	}
 }
@@ -82,25 +92,22 @@ func (aggregator *Aggregator) Run(parentContext context.Context) {
 	}
 }
 
-// TickOnce pulls the current interval snapshot, sends notifications for each subscription,
-// refreshes snapshots, and cleans unused session keys.
+// TickOnce sends notifications using accumulated reports from the Push buffer.
+// This is the Pure Push model - no active polling.
 // Returns number of notifications attempted (sum over all subscriptions) and any error.
 func (aggregator *Aggregator) TickOnce(ctx context.Context) (int, error) {
-	// 1. Record current time (as EndTime for this interval)
+	_ = ctx // ctx reserved for future cancellation support
+
 	now := time.Now()
-
-	// 2. Active Pull latest data
-	// Call using sourceProvider
-	currentSnapshot, err := aggregator.sourceProvider.SnapshotNow()
-	if err != nil {
-		aggregator.logger.Warn("ees snapshot failed", zap.Error(err))
-		return 0, err
-	}
-
 	totalNotifications := 0
 
-	// 3. Iterate over all subscriptions, calculate delta and send notifications
-	// [Fix 3] Use existing AllSubscriptions() method directly, no need to add Range()
+	// Lock and swap out the buffer
+	aggregator.mu.Lock()
+	bufferedReports := aggregator.reportBuffer
+	aggregator.reportBuffer = make(map[string][]UsageMeasures)
+	aggregator.mu.Unlock()
+
+	// Iterate over all subscriptions
 	subscriptions := aggregator.subscriptionStore.AllSubscriptions()
 
 	for _, subscription := range subscriptions {
@@ -115,84 +122,11 @@ func (aggregator *Aggregator) TickOnce(ctx context.Context) (int, error) {
 			continue
 		}
 
-		// [Core Fix] Rewrite calculation logic: Use LastSnapshot to calculate Delta
-		var usageMeasuresList []UsageMeasures
-
-		for key, currentCounters := range currentSnapshot {
-			// TODO: Add target filtering logic here in the future (e.g., if key.UEIP != sub.Filter.UEIP { continue })
-
-			// Try to get the last values from history
-			lastCounters, found := aggregator.lastSnapshot[key]
-
-			var deltaUL, deltaDL uint64
-			var deltaULPkt, deltaDLPkt uint64
-			var startTime time.Time
-
-			if !found {
-				// Case A: New Session (seen for the first time)
-				// Use total amount as baseline for the first report
-				deltaUL = currentCounters.ULBytes
-				deltaDL = currentCounters.DLBytes
-				deltaULPkt = currentCounters.ULPackets
-				deltaDLPkt = currentCounters.DLPackets
-
-				// Set StartTime to the creation time of the Session in Kernel
-				startTime = currentCounters.StartTime
-			} else {
-				// Case B: Old Session (calculate difference)
-
-				// Prevent Counter Overflow or Kernel restart
-				if currentCounters.ULBytes >= lastCounters.ULBytes {
-					deltaUL = currentCounters.ULBytes - lastCounters.ULBytes
-				} else {
-					deltaUL = currentCounters.ULBytes
-				}
-
-				if currentCounters.DLBytes >= lastCounters.DLBytes {
-					deltaDL = currentCounters.DLBytes - lastCounters.DLBytes
-				} else {
-					deltaDL = currentCounters.DLBytes
-				}
-
-				if currentCounters.ULPackets >= lastCounters.ULPackets {
-					deltaULPkt = currentCounters.ULPackets - lastCounters.ULPackets
-				} else {
-					deltaULPkt = currentCounters.ULPackets
-				}
-
-				if currentCounters.DLPackets >= lastCounters.DLPackets {
-					deltaDLPkt = currentCounters.DLPackets - lastCounters.DLPackets
-				} else {
-					deltaDLPkt = currentCounters.DLPackets
-				}
-
-				// [Critical Fix] StartTime should be "Time of the last Snapshot"
-				startTime = aggregator.lastSnapshotTime
-			}
-
-			// Assemble report item
-			usage := UsageMeasures{
-				Key:            key,
-				ULBytesDelta:   deltaUL,
-				DLBytesDelta:   deltaDL,
-				ULPacketsDelta: deltaULPkt,
-				DLPacketsDelta: deltaDLPkt,
-				StartTime:      startTime,
-				EndTime:        now,
-			}
-
-			// Calculate throughput (use new computeThroughputIfPossible logic, or calculate directly here)
-			durationSeconds := usage.EndTime.Sub(usage.StartTime).Seconds()
-			if durationSeconds > 0 {
-				usage.ULThroughputBps = (float64(usage.ULBytesDelta) * 8.0) / durationSeconds
-				usage.DLThroughputBps = (float64(usage.DLBytesDelta) * 8.0) / durationSeconds
-			}
-
-			usageMeasuresList = append(usageMeasuresList, usage)
-		}
+		// Get accumulated reports for this subscription
+		usageMeasuresList, hasReports := bufferedReports[subscription.ID]
 
 		if subscription.Mode == ModeOnDemand {
-			if len(usageMeasuresList) > 0 {
+			if hasReports && len(usageMeasuresList) > 0 {
 				if err := aggregator.notifier.Notify(subscription, usageMeasuresList); err != nil {
 					aggregator.logger.Warn("ees notify (on-demand) failed",
 						zap.String("subscriptionId", subscription.ID),
@@ -208,13 +142,13 @@ func (aggregator *Aggregator) TickOnce(ctx context.Context) (int, error) {
 					)
 				}
 			}
-			// Switch to Periodic after OnDemand processing (existing logic), or remove directly
+			// Switch to Periodic after OnDemand processing
 			subscription.Mode = ModePeriodic
 			continue
 		}
 
 		// PERIODIC mode
-		if len(usageMeasuresList) > 0 {
+		if hasReports && len(usageMeasuresList) > 0 {
 			if err := aggregator.notifier.Notify(subscription, usageMeasuresList); err != nil {
 				aggregator.logger.Warn("ees notify (periodic) failed",
 					zap.String("subscriptionId", subscription.ID),
@@ -232,17 +166,12 @@ func (aggregator *Aggregator) TickOnce(ctx context.Context) (int, error) {
 		}
 	}
 
-	// 4. Update state: Change Current to Last, prepare for the next Tick
-	aggregator.lastSnapshot = currentSnapshot
 	aggregator.lastSnapshotTime = now
-
 	return totalNotifications, nil
 }
 
 // PushReport handles unsolicited reports (e.g. from Kernel via Handler).
-// This is the "Push" path.
-// PushReport handles unsolicited reports (e.g. from Kernel via Handler).
-// This is the "Push" path.
+// Reports are accumulated in reportBuffer and sent during the next TickOnce().
 func (aggregator *Aggregator) PushReport(sessRpt report.SessReport) {
 	for _, r := range sessRpt.Reports {
 		if r.Type() != report.USAR {
@@ -256,7 +185,7 @@ func (aggregator *Aggregator) PushReport(sessRpt report.SessReport) {
 		// Iterate subscriptions to see if this report is relevant
 		subscriptions := aggregator.subscriptionStore.AllSubscriptions()
 		for _, sub := range subscriptions {
-			// [New] Check Shadow URR ID match
+			// Check Shadow URR ID match
 			if sub.ShadowURRID != usarep.URRID {
 				continue
 			}
@@ -273,13 +202,41 @@ func (aggregator *Aggregator) PushReport(sessRpt report.SessReport) {
 				EndTime:        usarep.EndTime,
 			}
 
-			// Compute Throughput if Trends (or if Start/End time is present)
+			// Populate UE IP from SessionContext and log source PDRs
+			var contributingPDRs []uint16
+			if aggregator.sessionProvider != nil {
+				contexts := aggregator.sessionProvider.GetSessionContexts()
+				if ctx, ok := contexts[sessRpt.SEID]; ok {
+					m.UeIpv4Addr = ctx.UeIPv4Addr
+
+					// Find PDRs associated with this URR
+					for _, pdr := range ctx.PDRs {
+						for _, uid := range pdr.URRIDs {
+							if uid == usarep.URRID {
+								contributingPDRs = append(contributingPDRs, pdr.PDRID)
+								break
+							}
+						}
+					}
+				}
+			}
+
+			// Compute Throughput
 			computeThroughputIfPossible(&m)
 
-			// Send immediately! (Push Model)
-			if err := aggregator.notifier.Notify(sub, []UsageMeasures{m}); err != nil {
-				aggregator.logger.Warn("ees push notify failed", zap.Error(err))
-			}
+			// Accumulate to buffer (will be sent in TickOnce)
+			aggregator.mu.Lock()
+			aggregator.reportBuffer[sub.ID] = append(aggregator.reportBuffer[sub.ID], m)
+			aggregator.mu.Unlock()
+
+			aggregator.logger.Info("ees shadow urr report received",
+				zap.String("subscriptionId", sub.ID),
+				zap.Uint32("shadowURRId", sub.ShadowURRID), // Log Shadow ID
+				zap.Uint64("seid", sessRpt.SEID),
+				zap.Uint64("ulBytes", m.ULBytesDelta),
+				zap.Uint64("dlBytes", m.DLBytesDelta),
+				zap.Uint16s("sourcePDRs", contributingPDRs),
+			)
 		}
 	}
 }

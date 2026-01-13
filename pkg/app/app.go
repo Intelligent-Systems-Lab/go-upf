@@ -165,26 +165,15 @@ func (u *UpfApp) Run() error {
 	u.pfcpServer.Start(&u.wg)
 
 	// =========================================================================
-	// [New] EES initialization logic (migrated from main.go and changed to dependency injection)
+	// [New] EES initialization logic (Pure Push mode - no polling)
 	// =========================================================================
 	if u.cfg.EES != nil && u.cfg.EES.Enabled {
-		logger.MainLog.Infoln("Starting EES Module...")
+		logger.MainLog.Infoln("Starting EES Module (Pure Push Mode)...")
 
 		// 1. Create Logger
 		eesLogger, _ := zap.NewDevelopment() // Simple error handling
 
-		// 2. Create Active Source (Core dependency injection)
-		// Injected u.driver (ForwarderDriver) and u.pfcpServer.LocalNode (SessionProvider) here
-		// Note: Ensure pfcpServer exposes LocalNode, or access via Getter
-		// Assuming lnode in pfcpServer struct is public (Lnode) or has GetLocalNode() method
-		// Since your pfcpServer defines lnode as lowercase (private),
-		// You may need to add a GetLocalNode() method in internal/pfcp/pfcp.go first,
-		// Or temporarily change lnode to Lnode (Public).
-		// Assuming you added a GetLocalNode():
-
-		pfcpSource := ees.NewActivePFCPSource(u.driver, u.pfcpServer.GetLocalNode())
-
-		// 3. Create Store / Notifier / Aggregator
+		// 2. Create Store / Notifier / Aggregator (no ActivePFCPSource needed for Push mode)
 		subscriptionStore := ees.NewSubscriptionStore("")
 		notifier := ees.NewNotifier(eesLogger)
 
@@ -193,27 +182,33 @@ func (u *UpfApp) Run() error {
 			period = u.cfg.EES.PeriodSec
 		}
 
+		// Pure Push mode: no sourceProvider needed, reports come from kernel
+		localNode := u.pfcpServer.GetLocalNode()
+		sessionProvider := localNode
+
 		aggregator := ees.NewAggregator(
-			pfcpSource, // Pass in the new Active Source
 			subscriptionStore,
 			time.Duration(period)*time.Second,
 			notifier,
 			eesLogger,
+			sessionProvider,
 		)
 
-		// 4. Register EES Handler to Dispatcher
+		// 3. Register EES Handler to Dispatcher
 		eesHandler := ees.NewHandler(aggregator, eesLogger)
 		reportDispatcher.RegisterEESHandler(eesHandler)
 
-		// 5. Start Aggregator and API Server
-		// Note: Aggregator still runs for Periodic Polling (if used) or just state maintenance.
-		// If purely Push, Run() might be empty, but we keep it for now.
+		// 4. Start Aggregator (processes buffered reports periodically)
 		go aggregator.Run(u.ctx)
 
-		// [New] Provisioner
-		provisioner := ees.NewProvisioner(u.driver)
-		// We also need session provider for "Any UE" broadcast provisioning
-		sessionProvider := u.pfcpServer.GetLocalNode()
+		// 5. Provisioner for creating Shadow URRs via PFCP Session context
+		// Wrap LocalNode.Sess() to convert *pfcp.Sess to ees.PFCPSess interface
+		sessGetter := func(lSeid uint64) (ees.PFCPSess, error) {
+			return localNode.Sess(lSeid)
+		}
+		sessProvider := ees.NewLocalNodeAdapter(sessGetter, localNode)
+		provisioner := ees.NewProvisioner(sessProvider)
+		// Session provider for "Any UE" broadcast provisioning
 		idManager := ees.NewIDManager()
 
 		listenAddr := u.cfg.EES.ListenAddr
@@ -228,7 +223,7 @@ func (u *UpfApp) Run() error {
 			}
 		}()
 
-		logger.MainLog.Infof("EES started at %s with period %ds", listenAddr, period)
+		logger.MainLog.Infof("EES started at %s with period %ds (Pure Push Mode)", listenAddr, period)
 	}
 	// =========================================================================
 

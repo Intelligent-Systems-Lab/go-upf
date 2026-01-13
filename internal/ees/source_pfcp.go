@@ -1,24 +1,15 @@
 // Package ees - UPF Event Exposure Service (EES)
-// source_pfcp.go: PFCP-backed Source implementation for EES (interval semantics, multi-URR aware).
+// source_pfcp.go: PFCP-backed Source implementation for EES.
 //
-// - Store per-session measurements per-URR: entriesBySessionKey[SessionKey][URRID] = pfcpEntry.
-// - OnUSAReport(sessionKey, urrID, intervalCounters) writes the latest interval for that URR.
-// - SnapshotNow() keeps the original Source interface:
-//     It MERGES all FRESH (not stale) URR entries under the same SessionKey into one Counters:
-//       * UL/DL bytes/packets: summed over URR
-//       * StartTime: min over URR
-//       * EndTime:   max over URR
-//   A session is included only if it has at least one fresh URR entry.
-// - Staleness: an URR entry is fresh if (now - lastUpdateTime) <= staleAfter.
+// DEPRECATED: This file contains legacy PFCPSource for passive report caching.
+// The current EES uses pure Push mode via aggregator.PushReport().
+// PFCPSource is kept for potential future use.
 
 package ees
 
 import (
-	"fmt"
 	"sync"
 	"time"
-
-	"github.com/free5gc/go-upf/internal/report"
 )
 
 // pfcpEntry stores one URR's latest interval counters and its last update time.
@@ -36,25 +27,6 @@ type PFCPSource struct {
 	// staleAfter controls staleness per URR entry. If now - lastUpdateTime > staleAfter,
 	// that URR entry is considered stale (excluded from merge).
 	staleAfter time.Duration
-}
-
-// ForwarderDriver defines the interface for communicating with the underlying forwarding layer (e.g., gtp5g)
-// Corresponds to the implementation in internal/forwarder/driver.go
-type ForwarderDriver interface {
-	QueryMultiURR(map[uint64][]uint32) (map[uint64][]report.USAReport, error)
-}
-
-// SessionProvider defines the interface for obtaining active Session information
-// Corresponds to the implementation of LocalNode in internal/pfcp/node.go
-type SessionProvider interface {
-	GetSessionContexts() map[uint64]SessionContext
-}
-
-// [Implement Source]
-// ActivePFCPSource is a stateless Source that actively queries the underlying layer for the latest data on every SnapshotNow.
-type ActivePFCPSource struct {
-	driver          ForwarderDriver
-	sessionProvider SessionProvider
 }
 
 // NewPFCPSource creates a PFCPSource with the given staleness threshold.
@@ -196,108 +168,4 @@ func (pfcpSource *PFCPSource) PruneStale() (removedCount int) {
 		}
 	}
 	return removedCount
-}
-
-// NewActivePFCPSource constructor
-func NewActivePFCPSource(driver ForwarderDriver, provider SessionProvider) *ActivePFCPSource {
-	return &ActivePFCPSource{
-		driver:          driver,
-		sessionProvider: provider,
-	}
-}
-
-// SnapshotNow executes active query (Active Pull)
-// 1. Get all Session contexts from Provider
-// 2. Batch query URR data from Driver
-// 3. Aggregate data and return
-func (s *ActivePFCPSource) SnapshotNow() (map[SessionKey]Counters, error) {
-	// 1. Get current active Session list
-	sessionCtxs := s.sessionProvider.GetSessionContexts()
-	if len(sessionCtxs) == 0 {
-		return nil, nil
-	}
-
-	// 2. Prepare batch query parameters (map[LocalSEID] -> []URRID)
-	queryMap := make(map[uint64][]uint32, len(sessionCtxs))
-	for lSeid, ctx := range sessionCtxs {
-		if len(ctx.URRIDs) > 0 {
-			queryMap[lSeid] = ctx.URRIDs
-		}
-	}
-
-	if len(queryMap) == 0 {
-		return nil, nil
-	}
-
-	// 3. Call Driver to execute batch query (Netlink interaction)
-	reportsMap, err := s.driver.QueryMultiURR(queryMap)
-
-	for _, reports := range reportsMap {
-		for _, r := range reports {
-			// Force print all URR info, even if it is 0
-			fmt.Printf("[DEBUG-EES] URR:%d UL:%d DL:%d\n",
-				r.URRID, r.VolumMeasure.UplinkVolume, r.VolumMeasure.DownlinkVolume)
-		}
-	}
-
-	if err != nil {
-		return nil, fmt.Errorf("active query failed: %w", err)
-	}
-
-	// 4. Convert and aggregate results
-	result := make(map[SessionKey]Counters, len(reportsMap))
-
-	for lSeid, reports := range reportsMap {
-		ctx, ok := sessionCtxs[lSeid]
-		if !ok {
-			// Session might be deleted during query, ignore this result
-			continue
-		}
-
-		// Aggregate data from multiple URRs under this Session
-		var merged Counters
-		var hasFresh bool
-
-		for _, r := range reports {
-			// If need to filter Stale data (e.g. Kernel not updated for a long time), check r.EndTime here
-			// However, Active Query usually gets the current value from Kernel
-
-			if !hasFresh {
-				// First data, initialize directly
-				merged = Counters{
-					ULBytes:   r.VolumMeasure.UplinkVolume,
-					DLBytes:   r.VolumMeasure.DownlinkVolume,
-					ULPackets: r.VolumMeasure.UplinkPktNum,
-					DLPackets: r.VolumMeasure.DownlinkPktNum,
-					StartTime: r.StartTime,
-					EndTime:   r.EndTime,
-				}
-				hasFresh = true
-			} else {
-				// Subsequent data, accumulate
-				merged.ULBytes += r.VolumMeasure.UplinkVolume
-				merged.DLBytes += r.VolumMeasure.DownlinkVolume
-				merged.ULPackets += r.VolumMeasure.UplinkPktNum
-				merged.DLPackets += r.VolumMeasure.DownlinkPktNum
-
-				// Time interval union (Start takes earliest, End takes latest)
-				if !r.StartTime.IsZero() && r.StartTime.Before(merged.StartTime) {
-					merged.StartTime = r.StartTime
-				}
-				if !r.EndTime.IsZero() && r.EndTime.After(merged.EndTime) {
-					merged.EndTime = r.EndTime
-				}
-			}
-		}
-
-		if hasFresh {
-			key := SessionKey{
-				LocalSEID:  lSeid,
-				RemoteSEID: ctx.RemoteSEID,
-			}
-			result[key] = merged
-		}
-	}
-
-	return result, nil
 }
