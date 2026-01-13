@@ -69,9 +69,10 @@ type NotificationData struct {
 }
 
 type ReportItem struct {
-	// Common Identifiers (MVP: SEID)
-	LocalSEID  uint64 `json:"localSeid,omitempty"`
-	RemoteSEID uint64 `json:"remoteSeid,omitempty"`
+	// TS 29.564 compliant identifiers
+	PduSeId    uint64 `json:"pduSeId,omitempty"`    // PDU Session ID (was LocalSEID)
+	Supi       string `json:"supi,omitempty"`       // Subscription Permanent Identifier
+	UeIpv4Addr string `json:"ueIpv4Addr,omitempty"` // UE IPv4 Address
 
 	// Event Objects
 	UsageMeasurements    *UserDataUsageMeasurements      `json:"usageMeasurements,omitempty"`
@@ -91,22 +92,37 @@ func (notifier *Notifier) Notify(subscription *Subscription, measures []UsageMea
 
 	for _, m := range measures {
 		item := ReportItem{
-			LocalSEID:  m.Key.LocalSEID,
-			RemoteSEID: m.Key.RemoteSEID,
+			PduSeId:    m.Key.LocalSEID,
+			UeIpv4Addr: m.UeIpv4Addr, // Populated from session context
 		}
 
 		if subscription.Event == EventUserDataUsageMeasures {
+			// TS 29.564: Only include measurements that were requested
 			item.UsageMeasurements = &UserDataUsageMeasurements{
-				VolumeMeasurement: VolumeMeasurement{
+				StartTime: m.StartTime,
+				EndTime:   m.EndTime,
+			}
+
+			// Conditionally add Volume Measurement
+			if subscription.HasMeasurementType(MeasureVolume) {
+				item.UsageMeasurements.VolumeMeasurement = VolumeMeasurement{
 					TotalVolume:     m.ULBytesDelta + m.DLBytesDelta,
 					UplinkVolume:    m.ULBytesDelta,
 					DownlinkVolume:  m.DLBytesDelta,
 					TotalPackets:    m.ULPacketsDelta + m.DLPacketsDelta,
 					UplinkPackets:   m.ULPacketsDelta,
 					DownlinkPackets: m.DLPacketsDelta,
-				},
-				StartTime: m.StartTime,
-				EndTime:   m.EndTime,
+				}
+			}
+
+			// Conditionally add Throughput Measurement
+			if subscription.HasMeasurementType(MeasureThroughput) {
+				item.ThroughputStatistics = &ThroughputStatisticMeasurement{
+					UlAverageThroughput: m.ULThroughputBps,
+					DlAverageThroughput: m.DLThroughputBps,
+					StartTime:           m.StartTime,
+					EndTime:             m.EndTime,
+				}
 			}
 		} else if subscription.Event == EventUserDataUsageTrends {
 			item.ThroughputStatistics = &ThroughputStatisticMeasurement{

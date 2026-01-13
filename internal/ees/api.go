@@ -90,7 +90,8 @@ type createSubscriptionRequest struct {
 }
 
 type UpfEvent struct {
-	Type string `json:"type"`
+	Type             string   `json:"type"`
+	MeasurementTypes []string `json:"measurementTypes,omitempty"` // TS 29.564: Required when type=USER_DATA_USAGE_MEASURES
 }
 
 type UpfEventMode struct {
@@ -99,7 +100,14 @@ type UpfEventMode struct {
 }
 
 type createSubscriptionResponse struct {
-	SubscriptionID string `json:"subscriptionId"`
+	SubscriptionID      string       `json:"subscriptionId"`
+	NfID                string       `json:"nfId"`
+	EventList           []UpfEvent   `json:"eventList"`
+	EventNotifyURI      string       `json:"eventNotifyUri"`
+	NotifyCorrelationID string       `json:"notifyCorrelationId,omitempty"`
+	EventReportingMode  UpfEventMode `json:"eventReportingMode"`
+	AnyUE               bool         `json:"anyUe,omitempty"`
+	UeIPAddress         string       `json:"ueIpAddress,omitempty"`
 }
 
 // ----- Handlers -----
@@ -188,7 +196,23 @@ func (server *Server) handleCreateSubscription(w http.ResponseWriter, r *http.Re
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
-	if err := json.NewEncoder(w).Encode(createSubscriptionResponse{SubscriptionID: subscriptionID}); err != nil {
+
+	// Build full subscription response per TS 29.564
+	response := createSubscriptionResponse{
+		SubscriptionID:      subscriptionID,
+		NfID:                subscriptionCandidate.NfID,
+		EventList:           inboundRequest.EventList,
+		EventNotifyURI:      subscriptionCandidate.NotifURI,
+		NotifyCorrelationID: subscriptionCandidate.NotifyCorrelationID,
+		EventReportingMode: UpfEventMode{
+			Trigger:      inboundRequest.EventReportingMode.Trigger,
+			ReportPeriod: subscriptionCandidate.PeriodSec,
+		},
+		AnyUE:       subscriptionCandidate.Target.AnyUE,
+		UeIPAddress: subscriptionCandidate.Target.UeIPAddress,
+	}
+
+	if err := json.NewEncoder(w).Encode(response); err != nil {
 		server.logger.Warn("write create-subscription response failed",
 			zap.String("subscriptionId", subscriptionID),
 			zap.Error(err),
@@ -201,13 +225,26 @@ func (server *Server) provisionURR(sub *Subscription) {
 		return
 	}
 
+	sessions := server.sessionProvider.GetSessionContexts()
+	targetSessions := make(map[uint64]SessionContext)
+
+	// Filter sessions based on target
 	if sub.Target.AnyUE {
-		sessions := server.sessionProvider.GetSessionContexts()
-		server.logger.Info("ees provisioning URR to existing sessions",
-			zap.Int("count", len(sessions)),
+		targetSessions = sessions
+	} else if sub.Target.UeIPAddress != "" {
+		for seid, session := range sessions {
+			if session.UeIPv4Addr == sub.Target.UeIPAddress {
+				targetSessions[seid] = session
+			}
+		}
+	}
+
+	if len(targetSessions) > 0 {
+		server.logger.Info("ees provisioning URR to target sessions",
+			zap.Int("count", len(targetSessions)),
 			zap.Uint32("shadowID", sub.ShadowURRID),
 		)
-		for seid, session := range sessions {
+		for seid, session := range targetSessions {
 			// 1. Create/Push the EES Shadow URR (Counter)
 			err := server.provisioner.PushURRToKernel(
 				seid,
@@ -337,12 +374,32 @@ func (server *Server) validateAndBuildSubscription(req createSubscriptionRequest
 
 	// MVP: Only support exactly one event which matches USER_DATA_USAGE_MEASURES
 	foundSupportedEvent := false
+	var measurementTypes []MeasurementType
 	for _, evt := range req.EventList {
 		if evt.Type == "" {
 			return nil, fmt.Errorf("missing mandatory attribute: eventList[].type")
 		}
 		if strings.ToUpper(evt.Type) == string(EventUserDataUsageMeasures) {
 			foundSupportedEvent = true
+
+			// TS 29.564: measurementTypes is mandatory for USER_DATA_USAGE_MEASURES
+			if len(evt.MeasurementTypes) == 0 {
+				return nil, fmt.Errorf("missing mandatory attribute: measurementTypes is required for USER_DATA_USAGE_MEASURES")
+			}
+
+			// Convert string types to MeasurementType
+			for _, mt := range evt.MeasurementTypes {
+				switch strings.ToUpper(mt) {
+				case string(MeasureVolume):
+					measurementTypes = append(measurementTypes, MeasureVolume)
+				case string(MeasureThroughput):
+					measurementTypes = append(measurementTypes, MeasureThroughput)
+				case string(MeasureAppInfo):
+					measurementTypes = append(measurementTypes, MeasureAppInfo)
+				default:
+					return nil, fmt.Errorf("unsupported measurementType: %s", mt)
+				}
+			}
 		} else {
 			// To-do: Support other event types
 			return nil, fmt.Errorf("not supported yet: event type %s", evt.Type)
@@ -389,8 +446,7 @@ func (server *Server) validateAndBuildSubscription(req createSubscriptionRequest
 		}
 		target.AnyUE = true
 	} else if req.UeIPAddress != "" {
-		// To-do: Implement filtering logic in aggregator to support specific UE targeting
-		return nil, fmt.Errorf("not supported yet: targeting specific ueIpAddress")
+		target.UeIPAddress = req.UeIPAddress
 	} else {
 		return nil, fmt.Errorf("missing target: must specify either anyUe=true or provide ueIpAddress")
 	}
@@ -405,6 +461,7 @@ func (server *Server) validateAndBuildSubscription(req createSubscriptionRequest
 		Mode:                chosenMode,
 		PeriodSec:           periodSec,
 		Target:              target,
+		MeasurementTypes:    measurementTypes, // TS 29.564
 		Snapshots:           make(map[SessionKey]Counters),
 	}
 
@@ -413,20 +470,17 @@ func (server *Server) validateAndBuildSubscription(req createSubscriptionRequest
 
 /*
 Example Valid Subscription Payload (JSON):
-
-{
-  "nfId": "smf-01",
-  "eventList": [
-    {
-      "type": "USER_DATA_USAGE_MEASURES"
-    }
-  ],
-  "eventNotifyUri": "http://10.0.0.10:8080/namf-callback/v1/nupf-event",
-  "notifyCorrelationId": "corr-12345",
-  "eventReportingMode": {
-    "trigger": "PERIODIC",
-    "reportPeriod": 10
-  },
-  "anyUe": true
-}
+curl -X POST http://127.0.0.1:8088/nupf-ee/v1/ee-subscriptions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "nfId": "smf-01",
+    "eventList": [{
+      "type": "USER_DATA_USAGE_MEASURES",
+      "measurementTypes": ["VOLUME_MEASUREMENT"]
+    }],
+    "eventNotifyUri": "http://127.0.0.1:9000/callback",
+    "notifyCorrelationId": "corr-12345",
+    "eventReportingMode": {"trigger": "PERIODIC", "reportPeriod": 30},
+    "anyUe": true
+  }'
 */

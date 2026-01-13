@@ -62,6 +62,19 @@ const (
 	ModeOnDemand Mode = "ON_DEMAND"
 )
 
+// MeasurementType specifies which measurements to include in reports.
+// TS 29.564: Required when event type is USER_DATA_USAGE_MEASURES.
+type MeasurementType string
+
+const (
+	// MeasureVolume requests volume measurements (bytes/packets).
+	MeasureVolume MeasurementType = "VOLUME_MEASUREMENT"
+	// MeasureThroughput requests throughput measurements (bit rate).
+	MeasureThroughput MeasurementType = "THROUGHPUT_MEASUREMENT"
+	// MeasureAppInfo requests application-related information.
+	MeasureAppInfo MeasurementType = "APPLICATION_RELATED_INFO"
+)
+
 // TargetScope defines the target selection for a subscription.
 // MVP: only AnyUE=true (all active PDU sessions).
 type TargetScope struct {
@@ -108,6 +121,9 @@ type UsageMeasures struct {
 	// Derived metrics (optional in MVP; aggregator may compute them).
 	ULThroughputBps float64
 	DLThroughputBps float64
+
+	// TS 29.564 UE identifiers
+	UeIpv4Addr string // UE IPv4 Address from session context
 }
 
 // Subscription holds the in-memory state for a single EES subscription.
@@ -122,6 +138,9 @@ type Subscription struct {
 	Mode                Mode
 	PeriodSec           int
 
+	// TS 29.564: MeasurementTypes specifies which measurements are requested.
+	MeasurementTypes []MeasurementType
+
 	CreatedAt  time.Time
 	LastNotify time.Time
 
@@ -132,6 +151,16 @@ type Subscription struct {
 	// Key: SessionKey (LocalSEID, RemoteSEID)
 	// Val: last counters over [StartTime, EndTime]
 	Snapshots map[SessionKey]Counters
+}
+
+// HasMeasurementType checks if the subscription requests the given measurement type.
+func (s *Subscription) HasMeasurementType(mt MeasurementType) bool {
+	for _, t := range s.MeasurementTypes {
+		if t == mt {
+			return true
+		}
+	}
+	return false
 }
 
 // Source abstracts the producer of session-level counters for EES.
@@ -148,6 +177,13 @@ type PDRContext struct {
 
 type SessionContext struct {
 	RemoteSEID uint64
+	UeIPv4Addr string // Added: UE IPv4 Address
 	URRIDs     []uint32
 	PDRs       []*PDRContext
+}
+
+// SessionProvider defines the interface for obtaining active Session information.
+// Used by API Server for provisioning Shadow URRs to all active sessions.
+type SessionProvider interface {
+	GetSessionContexts() map[uint64]SessionContext
 }

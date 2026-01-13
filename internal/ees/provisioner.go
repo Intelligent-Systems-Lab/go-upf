@@ -3,33 +3,48 @@ package ees
 import (
 	"time"
 
-	"github.com/free5gc/go-upf/internal/report"
 	"github.com/wmnsk/go-pfcp/ie"
 )
 
-// ForwarderProvisioner defines the interface for installing/removing URRs.
-type ForwarderProvisioner interface {
-	CreateURR(uint64, *ie.IE) error
-	RemoveURR(uint64, *ie.IE) ([]report.USAReport, error)
-	UpdatePDR(uint64, *ie.IE) error
+// SessURRProvisioner defines the interface for provisioning URRs through a PFCP Session.
+// This routes URR creation through the proper PFCP session context, ensuring
+// the session's URRIDs map is updated and the driver is called correctly.
+type SessURRProvisioner interface {
+	// Sess returns the session for the given local SEID.
+	Sess(lSeid uint64) (SessContext, error)
+}
+
+// SessContext represents a PFCP session context for URR operations.
+// This interface is implemented by *pfcp.Sess.
+type SessContext interface {
+	PFCPSess // Embed PFCPSess from adapter.go
 }
 
 // Provisioner handles the construction of PFCP rules (URR) for EES.
+// It uses the PFCP session context to properly create and manage URRs.
 type Provisioner struct {
-	driver ForwarderProvisioner
+	sessProvider SessURRProvisioner
 }
 
-func NewProvisioner(driver ForwarderProvisioner) *Provisioner {
+// NewProvisioner creates a Provisioner that uses session context for URR operations.
+func NewProvisioner(sessProvider SessURRProvisioner) *Provisioner {
 	return &Provisioner{
-		driver: driver,
+		sessProvider: sessProvider,
 	}
 }
 
 // PushURRToKernel creates a URR for the given SEID using the provided configuration.
+// This routes through the PFCP Session to ensure proper URR registration.
 func (p *Provisioner) PushURRToKernel(seid uint64, urrId uint32, event EventType, mode Mode, periodSec int) error {
-	// 1. Measurement Method
-	// MEASURES: Volume (Bit 0)
-	// TRENDS: Volume (Bit 0) + Duration (Bit 1)
+	// 1. Get the session context
+	sess, err := p.sessProvider.Sess(seid)
+	if err != nil {
+		return err
+	}
+
+	// 2. Build Measurement Method IE
+	// MEASURES: Volume (Bit 1 - VOLUM)
+	// TRENDS: Volume (Bit 1) + Duration (Bit 0 - DURAT)
 	vol := 1
 	dur := 0
 	evt := 0 // Event based not supported yet
@@ -38,25 +53,23 @@ func (p *Provisioner) PushURRToKernel(seid uint64, urrId uint32, event EventType
 	}
 	methodIE := ie.NewMeasurementMethod(dur, vol, evt)
 
-	// 2. Reporting Triggers
+	// 3. Build Reporting Triggers IE
 	// PERIODIC: Bit 0 (value 1)
-	// THRESHOLD: Bit 1 (value 2) - Not yet supported in arguments, defaulting to Periodic if mode is Periodic
-	var trigVal uint32 = 0
+	// Use 3 bytes for proper encoding as per TS 29.244
+	trigOctet1 := uint8(0)
 	if mode == ModePeriodic {
-		trigVal |= 1 // PERIO
+		trigOctet1 |= 0x01 // PERIO bit
 	}
-	// TODO: Handle Thresholds
+	triggerIE := ie.NewReportingTriggers(trigOctet1, 0, 0)
 
-	triggerIE := ie.NewReportingTriggers(uint8(trigVal)) // ie.NewReportingTriggers takes varargs of uint8 octets
-
-	// 3. Measurement Period (if Periodic)
+	// 4. Build Measurement Period IE (if Periodic)
 	var periodIE *ie.IE
 	if mode == ModePeriodic && periodSec > 0 {
 		periodDuration := time.Duration(periodSec) * time.Second
 		periodIE = ie.NewMeasurementPeriod(periodDuration)
 	}
 
-	// 4. Create URR IE
+	// 5. Construct CreateURR IE
 	ies := []*ie.IE{
 		ie.NewURRID(urrId),
 		methodIE,
@@ -68,28 +81,29 @@ func (p *Provisioner) PushURRToKernel(seid uint64, urrId uint32, event EventType
 
 	createUrrIE := ie.NewCreateURR(ies...)
 
-	// 5. Call Driver
-	return p.driver.CreateURR(seid, createUrrIE)
+	// 6. Call session's CreateURR (this updates session.URRIDs and calls driver)
+	return sess.CreateURR(createUrrIE)
 }
 
-// RemoveURRFromKernel removes the Shadow URR.
+// RemoveURRFromKernel removes the Shadow URR via the session context.
 func (p *Provisioner) RemoveURRFromKernel(seid uint64, urrId uint32) error {
-	// Construct Remove URR IE (usually just ID is needed in the PDR/URR context?)
-	// Remove URR maps to PFCP Session Deletion or Modification?
-	// It's Session Modification Request -> Remove URR IE.
-	// ie.NewRemoveURR(ie.NewURRID(urrId))
+	sess, err := p.sessProvider.Sess(seid)
+	if err != nil {
+		return err
+	}
 
-	modUrrIE := ie.NewRemoveURR(ie.NewURRID(urrId))
-
-	// Driver.RemoveURR expects the Message or IE?
-	// internal/forwarder/driver.go: RemoveURR(uint64, *ie.IE)
-	// It likely expects the RemoveURR IE structure.
-
-	_, err := p.driver.RemoveURR(seid, modUrrIE)
+	removeUrrIE := ie.NewRemoveURR(ie.NewURRID(urrId))
+	_, err = sess.RemoveURR(removeUrrIE)
 	return err
 }
 
-// UpdatePDRToKernel updates a PDR.
+// UpdatePDRToKernel updates a PDR to bind URR IDs via the session context.
 func (p *Provisioner) UpdatePDRToKernel(seid uint64, pdrIE *ie.IE) error {
-	return p.driver.UpdatePDR(seid, pdrIE)
+	sess, err := p.sessProvider.Sess(seid)
+	if err != nil {
+		return err
+	}
+
+	_, err = sess.UpdatePDR(pdrIE)
+	return err
 }

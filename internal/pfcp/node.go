@@ -32,17 +32,18 @@ type URRInfo struct {
 }
 
 type Sess struct {
-	rnode    *RemoteNode
-	LocalID  uint64
-	RemoteID uint64
-	PDRIDs   map[uint16]*PDRInfo    // key: PDR_ID
-	FARIDs   map[uint32]struct{}    // key: FAR_ID
-	QERIDs   map[uint32]struct{}    // key: QER_ID
-	URRIDs   map[uint32]*URRInfo    // key: URR_ID
-	BARIDs   map[uint8]struct{}     // key: BAR_ID
-	q        map[uint16]chan []byte // key: PDR_ID
-	qlen     int
-	log      *logrus.Entry
+	rnode      *RemoteNode
+	LocalID    uint64
+	RemoteID   uint64
+	UeIPv4Addr string                 // Added: UE IPv4 Address derived from PDR
+	PDRIDs     map[uint16]*PDRInfo    // key: PDR_ID
+	FARIDs     map[uint32]struct{}    // key: FAR_ID
+	QERIDs     map[uint32]struct{}    // key: QER_ID
+	URRIDs     map[uint32]*URRInfo    // key: URR_ID
+	BARIDs     map[uint8]struct{}     // key: BAR_ID
+	q          map[uint16]chan []byte // key: PDR_ID
+	qlen       int
+	log        *logrus.Entry
 }
 
 func (s *Sess) Close() []report.USAReport {
@@ -121,6 +122,19 @@ func (s *Sess) CreatePDR(req *ie.IE) error {
 			urrInfo, ok := s.URRIDs[v]
 			if ok {
 				urrInfo.refPdrNum++
+			}
+		case ie.PDI:
+			pdi, err1 := i.PDI()
+			if err1 == nil {
+				for _, subIE := range pdi {
+					if subIE.Type == ie.UEIPAddress {
+						if ueIP, err2 := subIE.UEIPAddress(); err2 == nil {
+							if ueIP.IPv4Address != nil {
+								s.UeIPv4Addr = ueIP.IPv4Address.String()
+							}
+						}
+					}
+				}
 			}
 		}
 	}
@@ -731,6 +745,7 @@ func (n *LocalNode) GetSessionContexts() map[uint64]ees.SessionContext {
 
 			result[sess.LocalID] = ees.SessionContext{
 				RemoteSEID: sess.RemoteID,
+				UeIPv4Addr: sess.UeIPv4Addr,
 				URRIDs:     urrIDs,
 				PDRs:       pdrs,
 			}
