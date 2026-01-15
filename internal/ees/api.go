@@ -90,8 +90,11 @@ type createSubscriptionRequest struct {
 }
 
 type UpfEvent struct {
-	Type             string   `json:"type"`
-	MeasurementTypes []string `json:"measurementTypes,omitempty"` // TS 29.564: Required when type=USER_DATA_USAGE_MEASURES
+	Type                     string            `json:"type"`
+	MeasurementTypes         []string          `json:"measurementTypes,omitempty"`         // TS 29.564: Required when type=USER_DATA_USAGE_MEASURES
+	GranularityOfMeasurement string            `json:"granularityOfMeasurement,omitempty"` // PER_SESSION, PER_APPLICATION, PER_FLOW
+	AppIds                   []string          `json:"appIds,omitempty"`                   // Required for PER_APPLICATION
+	TrafficFilters           []FlowInformation `json:"trafficFilters,omitempty"`           // Required for PER_FLOW
 }
 
 type UpfEventMode struct {
@@ -375,6 +378,10 @@ func (server *Server) validateAndBuildSubscription(req createSubscriptionRequest
 	// MVP: Only support exactly one event which matches USER_DATA_USAGE_MEASURES
 	foundSupportedEvent := false
 	var measurementTypes []MeasurementType
+	var granularity Granularity = GranularityPerSession // Default
+	var appIds []string
+	var trafficFilters []FlowInformation
+
 	for _, evt := range req.EventList {
 		if evt.Type == "" {
 			return nil, fmt.Errorf("missing mandatory attribute: eventList[].type")
@@ -398,6 +405,30 @@ func (server *Server) validateAndBuildSubscription(req createSubscriptionRequest
 					measurementTypes = append(measurementTypes, MeasureAppInfo)
 				default:
 					return nil, fmt.Errorf("unsupported measurementType: %s", mt)
+				}
+			}
+
+			// Parse granularityOfMeasurement (optional, defaults to PER_SESSION)
+			if evt.GranularityOfMeasurement != "" {
+				switch strings.ToUpper(evt.GranularityOfMeasurement) {
+				case string(GranularityPerSession):
+					granularity = GranularityPerSession
+				case string(GranularityPerApplication):
+					granularity = GranularityPerApplication
+					// Validate: PER_APPLICATION requires appIds
+					if len(evt.AppIds) == 0 {
+						return nil, fmt.Errorf("missing mandatory attribute: appIds is required when granularityOfMeasurement is PER_APPLICATION")
+					}
+					appIds = evt.AppIds
+				case string(GranularityPerFlow):
+					granularity = GranularityPerFlow
+					// Validate: PER_FLOW requires trafficFilters
+					if len(evt.TrafficFilters) == 0 {
+						return nil, fmt.Errorf("missing mandatory attribute: trafficFilters is required when granularityOfMeasurement is PER_FLOW")
+					}
+					trafficFilters = evt.TrafficFilters
+				default:
+					return nil, fmt.Errorf("unsupported granularityOfMeasurement: %s", evt.GranularityOfMeasurement)
 				}
 			}
 		} else {
@@ -457,11 +488,13 @@ func (server *Server) validateAndBuildSubscription(req createSubscriptionRequest
 		NotifyCorrelationID: req.NotifyCorrelationID,
 		NfID:                req.NfID,
 		Event:               EventUserDataUsageMeasures,
-		Granularity:         GranularityPerPduSession, // Fixed for MVP
+		Granularity:         granularity,
 		Mode:                chosenMode,
 		PeriodSec:           periodSec,
 		Target:              target,
-		MeasurementTypes:    measurementTypes, // TS 29.564
+		MeasurementTypes:    measurementTypes,
+		AppIds:              appIds,
+		TrafficFilters:      trafficFilters,
 		Snapshots:           make(map[SessionKey]Counters),
 	}
 
@@ -469,7 +502,62 @@ func (server *Server) validateAndBuildSubscription(req createSubscriptionRequest
 }
 
 /*
-Example Valid Subscription Payload (JSON):
+Example Subscription Payloads (JSON):
+
+=== 1. PER_SESSION (Default) ===
+curl -X POST http://127.0.0.1:8088/nupf-ee/v1/ee-subscriptions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "nfId": "smf-01",
+    "eventList": [{
+      "type": "USER_DATA_USAGE_MEASURES",
+      "measurementTypes": ["VOLUME_MEASUREMENT", "THROUGHPUT_MEASUREMENT"],
+      "granularityOfMeasurement": "PER_SESSION"
+    }],
+    "eventNotifyUri": "http://127.0.0.1:9000/callback",
+    "notifyCorrelationId": "corr-session-001",
+    "eventReportingMode": {"trigger": "PERIODIC", "reportPeriod": 30},
+    "anyUe": true
+  }'
+
+=== 2. PER_APPLICATION (Requires appIds) ===
+curl -X POST http://127.0.0.1:8088/nupf-ee/v1/ee-subscriptions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "nfId": "nwdaf-01",
+    "eventList": [{
+      "type": "USER_DATA_USAGE_MEASURES",
+      "measurementTypes": ["VOLUME_MEASUREMENT"],
+      "granularityOfMeasurement": "PER_APPLICATION",
+      "appIds": ["app-youtube", "app-netflix", "app-web"]
+    }],
+    "eventNotifyUri": "http://127.0.0.1:9000/app-usage-callback",
+    "notifyCorrelationId": "corr-app-001",
+    "eventReportingMode": {"trigger": "PERIODIC", "reportPeriod": 60},
+    "anyUe": true
+  }'
+
+=== 3. PER_FLOW (Requires trafficFilters) ===
+curl -X POST http://127.0.0.1:8088/nupf-ee/v1/ee-subscriptions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "nfId": "pcf-01",
+    "eventList": [{
+      "type": "USER_DATA_USAGE_MEASURES",
+      "measurementTypes": ["VOLUME_MEASUREMENT"],
+      "granularityOfMeasurement": "PER_FLOW",
+      "trafficFilters": [
+        {"flowDescription": "permit in ip from any to 10.0.0.0/8", "flowDirection": "DOWNLINK"},
+        {"flowDescription": "permit out ip from 10.0.0.0/8 to any", "flowDirection": "UPLINK"}
+      ]
+    }],
+    "eventNotifyUri": "http://127.0.0.1:9000/flow-usage-callback",
+    "notifyCorrelationId": "corr-flow-001",
+    "eventReportingMode": {"trigger": "PERIODIC", "reportPeriod": 10},
+    "ueIpAddress": "10.60.0.1"
+  }'
+
+=== 4. Specific UE Targeting (with PER_SESSION) ===
 curl -X POST http://127.0.0.1:8088/nupf-ee/v1/ee-subscriptions \
   -H 'Content-Type: application/json' \
   -d '{
@@ -479,8 +567,8 @@ curl -X POST http://127.0.0.1:8088/nupf-ee/v1/ee-subscriptions \
       "measurementTypes": ["VOLUME_MEASUREMENT"]
     }],
     "eventNotifyUri": "http://127.0.0.1:9000/callback",
-    "notifyCorrelationId": "corr-12345",
-    "eventReportingMode": {"trigger": "PERIODIC", "reportPeriod": 30},
-    "anyUe": true
+    "notifyCorrelationId": "corr-ue-001",
+    "eventReportingMode": {"trigger": "ONE_TIME"},
+    "ueIpAddress": "10.10.0.1"
   }'
 */

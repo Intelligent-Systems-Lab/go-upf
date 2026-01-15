@@ -119,7 +119,6 @@ func (s *PfcpServer) serveUSAReport(addr net.Addr, lSeid uint64, usars []report.
 				r.IEsWithinSessReportReq(
 					urrInfo.MeasureMethod, urrInfo.MeasureInformation)...,
 			))
-		s.log.Infof("serveUSAReport: SEID:%#x, Report:%+v, URRInfo:%+v", lSeid, r, urrInfo)
 	}
 
 	err = s.sendReqTo(req, addr)
