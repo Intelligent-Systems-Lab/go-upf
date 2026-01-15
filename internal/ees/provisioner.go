@@ -69,11 +69,17 @@ func (p *Provisioner) PushURRToKernel(seid uint64, urrId uint32, event EventType
 		periodIE = ie.NewMeasurementPeriod(periodDuration)
 	}
 
-	// 5. Construct CreateURR IE
+	// 5. Build Measurement Information IE
+	// MNOP (Measurement of Number of Packets): Bit 4 (0x10)
+	// This enables packet count reporting in addition to volume
+	measurementInfoIE := ie.NewMeasurementInformation(0x10) // MNOP flag
+
+	// 6. Construct CreateURR IE
 	ies := []*ie.IE{
 		ie.NewURRID(urrId),
 		methodIE,
 		triggerIE,
+		measurementInfoIE,
 	}
 	if periodIE != nil {
 		ies = append(ies, periodIE)
@@ -81,7 +87,7 @@ func (p *Provisioner) PushURRToKernel(seid uint64, urrId uint32, event EventType
 
 	createUrrIE := ie.NewCreateURR(ies...)
 
-	// 6. Call session's CreateURR (this updates session.URRIDs and calls driver)
+	// 7. Call session's CreateURR (this updates session.URRIDs and calls driver)
 	return sess.CreateURR(createUrrIE)
 }
 

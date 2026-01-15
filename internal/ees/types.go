@@ -17,29 +17,37 @@ const (
 	EventUserDataUsageTrends EventType = "USER_DATA_USAGE_TRENDS"
 )
 
-// UserDataUsageMeasurements represents VOLUME-based measurements (Measures event).
+// UserDataUsageMeasurements represents measurements per TS 29.564.
+// Contains volume and/or throughput statistics measurements.
 type UserDataUsageMeasurements struct {
-	VolumeMeasurement VolumeMeasurement `json:"volumeMeasurement"`
-	// Time window
-	StartTime time.Time `json:"startTime,omitempty"`
-	EndTime   time.Time `json:"endTime,omitempty"`
+	// Granularity identifiers
+	AppId    string           `json:"appId,omitempty"`    // For PER_APPLICATION granularity
+	FlowInfo *FlowInformation `json:"flowInfo,omitempty"` // For PER_FLOW granularity
+
+	VolumeMeasurement               *VolumeMeasurement               `json:"volumeMeasurement,omitempty"`
+	ThroughputStatisticsMeasurement *ThroughputStatisticsMeasurement `json:"throughputStatisticsMeasurement,omitempty"`
 }
 
+// FlowInformation per TS 29.512 FlowInformation schema.
+type FlowInformation struct {
+	FlowDescription string `json:"flowDescription,omitempty"` // IPFilterRule format
+	FlowDirection   string `json:"flowDirection,omitempty"`   // UPLINK, DOWNLINK, BIDIRECTIONAL
+}
+
+// VolumeMeasurement per TS 29.564 schema.
 type VolumeMeasurement struct {
-	TotalVolume     uint64 `json:"totalVolume,omitempty"`
-	UplinkVolume    uint64 `json:"uplinkVolume,omitempty"`
-	DownlinkVolume  uint64 `json:"downlinkVolume,omitempty"`
-	TotalPackets    uint64 `json:"totalPackets,omitempty"`
-	UplinkPackets   uint64 `json:"uplinkPackets,omitempty"`
-	DownlinkPackets uint64 `json:"downlinkPackets,omitempty"`
+	TotalVolume      uint64 `json:"totalVolume,omitempty"`
+	UlVolume         uint64 `json:"ulVolume,omitempty"`
+	DlVolume         uint64 `json:"dlVolume,omitempty"`
+	TotalNbOfPackets uint64 `json:"totalNbOfPackets,omitempty"`
+	UlNbOfPackets    uint64 `json:"ulNbOfPackets,omitempty"`
+	DlNbOfPackets    uint64 `json:"dlNbOfPackets,omitempty"`
 }
 
-// ThroughputStatisticMeasurement represents TRENDS-based statistics.
-type ThroughputStatisticMeasurement struct {
-	UlAverageThroughput float64   `json:"ulAverageThroughput,omitempty"` // bps
-	DlAverageThroughput float64   `json:"dlAverageThroughput,omitempty"` // bps
-	StartTime           time.Time `json:"startTime,omitempty"`
-	EndTime             time.Time `json:"endTime,omitempty"`
+// ThroughputStatisticsMeasurement per TS 29.564 schema.
+type ThroughputStatisticsMeasurement struct {
+	UlAverageThroughput string `json:"ulAverageThroughput,omitempty"` // BitRate as string per spec
+	DlAverageThroughput string `json:"dlAverageThroughput,omitempty"` // BitRate as string per spec
 }
 
 // Granularity controls the level of aggregation for the event.
@@ -47,7 +55,12 @@ type ThroughputStatisticMeasurement struct {
 type Granularity string
 
 const (
-	GranularityPerPduSession Granularity = "perPduSession"
+	// GranularityPerSession reports measurements per PDU session.
+	GranularityPerSession Granularity = "PER_SESSION"
+	// GranularityPerApplication reports measurements grouped by application ID.
+	GranularityPerApplication Granularity = "PER_APPLICATION"
+	// GranularityPerFlow reports measurements grouped by traffic flow.
+	GranularityPerFlow Granularity = "PER_FLOW"
 )
 
 // Mode controls how a subscription is served.
@@ -140,6 +153,10 @@ type Subscription struct {
 
 	// TS 29.564: MeasurementTypes specifies which measurements are requested.
 	MeasurementTypes []MeasurementType
+
+	// TS 29.564: Granularity-specific filters
+	AppIds         []string          `json:"appIds,omitempty"`         // For PER_APPLICATION
+	TrafficFilters []FlowInformation `json:"trafficFilters,omitempty"` // For PER_FLOW
 
 	CreatedAt  time.Time
 	LastNotify time.Time

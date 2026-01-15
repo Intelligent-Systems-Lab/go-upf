@@ -58,8 +58,9 @@ func (store *SubscriptionStore) CreateSubscription(newSubscription *Subscription
 	if newSubscription.Mode == "" {
 		return "", fmt.Errorf("%w: missing Mode", ErrInvalidSubscription)
 	}
-	if newSubscription.PeriodSec <= 0 {
-		return "", fmt.Errorf("%w: PeriodSec must be > 0", ErrInvalidSubscription)
+	// PeriodSec is only required for PERIODIC mode
+	if newSubscription.Mode == ModePeriodic && newSubscription.PeriodSec <= 0 {
+		return "", fmt.Errorf("%w: PeriodSec must be > 0 for PERIODIC mode", ErrInvalidSubscription)
 	}
 	if newSubscription.NfID == "" {
 		return "", fmt.Errorf("%w: missing NfID", ErrInvalidSubscription)

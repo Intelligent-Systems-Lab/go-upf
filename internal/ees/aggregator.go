@@ -113,7 +113,7 @@ func (aggregator *Aggregator) TickOnce(ctx context.Context) (int, error) {
 	for _, subscription := range subscriptions {
 		// MVP scope: only USER_DATA_USAGE_MEASURES + perPduSession
 		if subscription.Event != EventUserDataUsageMeasures ||
-			subscription.Granularity != GranularityPerPduSession {
+			subscription.Granularity != GranularityPerSession {
 			aggregator.logger.Debug("ees aggregator skip unsupported subscription",
 				zap.String("subscriptionId", subscription.ID),
 				zap.String("event", string(subscription.Event)),
