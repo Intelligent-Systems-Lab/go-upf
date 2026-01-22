@@ -8,8 +8,7 @@
 // Scope & constraints (MVP):
 // - Only USER_DATA_USAGE_MEASURES + perPduSession are accepted.
 // - Mode supports PERIODIC and ON_DEMAND; ON_DEMAND triggers an immediate TickOnce().
-// - PeriodSec in request is stored in subscription (for future per-subscription period),
-//   but the aggregator currently uses a global reportPeriod from config.
+// - Uses SMF-provisioned URRs for data collection (no Shadow URR).
 
 package ees
 
@@ -22,7 +21,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/wmnsk/go-pfcp/ie"
 	"go.uber.org/zap"
 )
 
@@ -30,9 +28,6 @@ import (
 type Server struct {
 	subscriptionStore *SubscriptionStore
 	aggregator        *Aggregator
-	provisioner       *Provisioner
-	sessionProvider   SessionProvider
-	idManager         *IDManager
 	logger            *zap.Logger
 }
 
@@ -40,17 +35,11 @@ type Server struct {
 func NewServer(
 	store *SubscriptionStore,
 	aggregator *Aggregator,
-	provisioner *Provisioner,
-	sessionProvider SessionProvider,
-	idManager *IDManager,
 	logger *zap.Logger,
 ) *Server {
 	return &Server{
 		subscriptionStore: store,
 		aggregator:        aggregator,
-		provisioner:       provisioner,
-		sessionProvider:   sessionProvider,
-		idManager:         idManager,
 		logger:            logger,
 	}
 }
@@ -78,6 +67,11 @@ func (server *Server) Serve(listenAddress string) error {
 // ----- Request/Response models -----
 
 type createSubscriptionRequest struct {
+	Subscription UpfEventSubscription `json:"subscription"`
+	// SupportedFeatures string `json:"supportedFeatures,omitempty"` // Not implemented yet
+}
+
+type UpfEventSubscription struct {
 	NfID                string       `json:"nfId"`
 	EventList           []UpfEvent   `json:"eventList"`
 	EventNotifyURI      string       `json:"eventNotifyUri"`
@@ -103,14 +97,9 @@ type UpfEventMode struct {
 }
 
 type createSubscriptionResponse struct {
-	SubscriptionID      string       `json:"subscriptionId"`
-	NfID                string       `json:"nfId"`
-	EventList           []UpfEvent   `json:"eventList"`
-	EventNotifyURI      string       `json:"eventNotifyUri"`
-	NotifyCorrelationID string       `json:"notifyCorrelationId,omitempty"`
-	EventReportingMode  UpfEventMode `json:"eventReportingMode"`
-	AnyUE               bool         `json:"anyUe,omitempty"`
-	UeIPAddress         string       `json:"ueIpAddress,omitempty"`
+	Subscription   UpfEventSubscription `json:"subscription"`
+	SubscriptionID string               `json:"subscriptionId"`
+	// ReportList     []NotificationItem   `json:"reportList,omitempty"` // Not implemented in immediate response yet
 }
 
 // ----- Handlers -----
@@ -134,22 +123,8 @@ func (server *Server) handleCreateSubscription(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	// [New] Allocate Shadow URR ID
-	if server.idManager != nil {
-		shadowID, err := server.idManager.Allocate()
-		if err != nil {
-			http.Error(w, fmt.Sprintf("allocate shadow id failed: %v", err), http.StatusInternalServerError)
-			return
-		}
-		subscriptionCandidate.ShadowURRID = shadowID
-	}
-
 	subscriptionID, err := server.subscriptionStore.CreateSubscription(subscriptionCandidate)
 	if err != nil {
-		// Rollback ID if create failed
-		if server.idManager != nil {
-			server.idManager.Release(subscriptionCandidate.ShadowURRID)
-		}
 		status := http.StatusInternalServerError
 		if errors.Is(err, ErrInvalidSubscription) {
 			status = http.StatusBadRequest
@@ -158,16 +133,9 @@ func (server *Server) handleCreateSubscription(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	// Hybrid Logic: Path A (Immediate/Pull) and Path B (Periodic/Push)
-
-	// Path A: Immediate (ModeOnDemand or logic implies immediate report)
-	// If Trigger=ONE_TIME, it's OnDemand.
+	// On-demand mode: trigger immediate report
 	if subscriptionCandidate.Mode == ModeOnDemand {
 		go func() {
-			// Trigger One-Time Pull (using existing polling logic for now, querying standard URRs?)
-			// Note: If we want to query Shadow URR, we must create it first.
-			// But OnDemand usually means "current status".
-			// We use classic Aggregator Tick (Pull) for this.
 			if _, tickErr := server.aggregator.TickOnce(context.Background()); tickErr != nil {
 				server.logger.Warn("ees on-demand immediate tick failed",
 					zap.String("subscriptionId", subscriptionID),
@@ -177,42 +145,38 @@ func (server *Server) handleCreateSubscription(w http.ResponseWriter, r *http.Re
 		}()
 	}
 
-	// Path B: Periodic (Push via Kernel Shadow URR)
-	if subscriptionCandidate.Mode == ModePeriodic {
-		go func() {
-			server.provisionURR(subscriptionCandidate)
-		}()
-	}
-
 	server.logger.Info("ees subscription created",
 		zap.String("subscriptionId", subscriptionID),
-		zap.Uint32("shadowUrrId", subscriptionCandidate.ShadowURRID), // Log Shadow ID
 		zap.String("nfId", subscriptionCandidate.NfID),
 		zap.String("notifUri", subscriptionCandidate.NotifURI),
 		zap.String("event", string(subscriptionCandidate.Event)),
 		zap.String("mode", string(subscriptionCandidate.Mode)),
-		zap.String("trigger", inboundRequest.EventReportingMode.Trigger),
+		zap.String("trigger", inboundRequest.Subscription.EventReportingMode.Trigger),
 		zap.Int("periodSec", subscriptionCandidate.PeriodSec),
 		zap.Bool("targetAnyUE", subscriptionCandidate.Target.AnyUE),
 		zap.String("targetUeIP", subscriptionCandidate.Target.UeIPAddress),
 	)
 
+	locationURI := fmt.Sprintf("%s/nupf-ee/v1/ee-subscriptions/%s", getAPIRoot(r), subscriptionID)
+	w.Header().Set("Location", locationURI)
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
 
 	// Build full subscription response per TS 29.564
 	response := createSubscriptionResponse{
-		SubscriptionID:      subscriptionID,
-		NfID:                subscriptionCandidate.NfID,
-		EventList:           inboundRequest.EventList,
-		EventNotifyURI:      subscriptionCandidate.NotifURI,
-		NotifyCorrelationID: subscriptionCandidate.NotifyCorrelationID,
-		EventReportingMode: UpfEventMode{
-			Trigger:      inboundRequest.EventReportingMode.Trigger,
-			ReportPeriod: subscriptionCandidate.PeriodSec,
+		SubscriptionID: subscriptionID,
+		Subscription: UpfEventSubscription{
+			NfID:                subscriptionCandidate.NfID,
+			EventList:           inboundRequest.Subscription.EventList,
+			EventNotifyURI:      subscriptionCandidate.NotifURI,
+			NotifyCorrelationID: subscriptionCandidate.NotifyCorrelationID,
+			EventReportingMode: UpfEventMode{
+				Trigger:      inboundRequest.Subscription.EventReportingMode.Trigger,
+				ReportPeriod: subscriptionCandidate.PeriodSec,
+			},
+			AnyUE:       subscriptionCandidate.Target.AnyUE,
+			UeIPAddress: subscriptionCandidate.Target.UeIPAddress,
 		},
-		AnyUE:       subscriptionCandidate.Target.AnyUE,
-		UeIPAddress: subscriptionCandidate.Target.UeIPAddress,
 	}
 
 	if err := json.NewEncoder(w).Encode(response); err != nil {
@@ -220,96 +184,6 @@ func (server *Server) handleCreateSubscription(w http.ResponseWriter, r *http.Re
 			zap.String("subscriptionId", subscriptionID),
 			zap.Error(err),
 		)
-	}
-}
-
-func (server *Server) provisionURR(sub *Subscription) {
-	if server.provisioner == nil || server.sessionProvider == nil {
-		return
-	}
-
-	sessions := server.sessionProvider.GetSessionContexts()
-	targetSessions := make(map[uint64]SessionContext)
-
-	// Filter sessions based on target
-	if sub.Target.AnyUE {
-		targetSessions = sessions
-	} else if sub.Target.UeIPAddress != "" {
-		for seid, session := range sessions {
-			if session.UeIPv4Addr == sub.Target.UeIPAddress {
-				targetSessions[seid] = session
-			}
-		}
-	}
-
-	if len(targetSessions) > 0 {
-		server.logger.Info("ees provisioning URR to target sessions",
-			zap.Int("count", len(targetSessions)),
-			zap.Uint32("shadowID", sub.ShadowURRID),
-		)
-		for seid, session := range targetSessions {
-			// 1. Create/Push the EES Shadow URR (Counter)
-			err := server.provisioner.PushURRToKernel(
-				seid,
-				sub.ShadowURRID,
-				sub.Event,
-				sub.Mode,
-				sub.PeriodSec,
-			)
-			if err != nil {
-				server.logger.Warn("ees provisioning failed for session",
-					zap.Uint64("seid", seid),
-					zap.Error(err),
-				)
-				continue
-			}
-
-			// 2. Bind this new URR to existing PDRs
-			// In PFCP, a URR only counts if a PDR points to it.
-			// We must update relevant PDRs to include the new URR ID.
-			for _, pdr := range session.PDRs {
-				// Avoid duplicates
-				hasShadow := false
-				for _, uid := range pdr.URRIDs {
-					if uid == sub.ShadowURRID {
-						hasShadow = true
-						break
-					}
-				}
-				if hasShadow {
-					continue
-				}
-
-				// Construct new URR list (Old + Shadow)
-				newURRIDs := make([]uint32, len(pdr.URRIDs)+1)
-				copy(newURRIDs, pdr.URRIDs)
-				newURRIDs[len(pdr.URRIDs)] = sub.ShadowURRID
-
-				// Construct UpdatePDR IE
-				// We only send PDR ID and the new list of URR IDs.
-				// Based on TS 29.244, other fields remain unchanged if not present.
-				ies := []*ie.IE{
-					ie.NewPDRID(pdr.PDRID),
-				}
-				for _, uid := range newURRIDs {
-					ies = append(ies, ie.NewURRID(uid))
-				}
-				updatePdrIE := ie.NewUpdatePDR(ies...)
-
-				// Push to Kernel
-				if err := server.provisioner.UpdatePDRToKernel(seid, updatePdrIE); err != nil {
-					server.logger.Warn("ees linking PDR to URR failed",
-						zap.Uint64("seid", seid),
-						zap.Uint16("pdrId", pdr.PDRID),
-						zap.Error(err),
-					)
-				} else {
-					// Update local Session Context to reflect the change
-					// This ensures future operations know about the link
-					pdr.URRIDs = newURRIDs
-				}
-			}
-		}
 	}
 }
 
@@ -327,28 +201,14 @@ func (server *Server) handleDeleteSubscriptionByID(w http.ResponseWriter, r *htt
 	}
 	subscriptionID := path
 
-	// Get subscription to find Shadow ID
-	sub, found := server.subscriptionStore.GetSubscription(subscriptionID)
+	// Check subscription exists
+	_, found := server.subscriptionStore.GetSubscription(subscriptionID)
 	if !found {
 		http.Error(w, "subscription not found", http.StatusNotFound)
 		return
 	}
 
-	// Release ID
-	if server.idManager != nil {
-		server.idManager.Release(sub.ShadowURRID)
-	}
-
-	// Remove URR from Kernel (Best Effort)
-	if server.provisioner != nil && server.sessionProvider != nil && sub.Target.AnyUE {
-		sessions := server.sessionProvider.GetSessionContexts()
-		for seid := range sessions {
-			_ = server.provisioner.RemoveURRFromKernel(seid, sub.ShadowURRID)
-		}
-	}
-
 	if err := server.subscriptionStore.DeleteSubscription(subscriptionID); err != nil {
-		// Log error but we already cleaned up resources roughly
 		server.logger.Error("delete subscription store failed", zap.Error(err))
 	}
 
@@ -359,19 +219,20 @@ func (server *Server) handleDeleteSubscriptionByID(w http.ResponseWriter, r *htt
 // ----- Helpers -----
 
 func (server *Server) validateAndBuildSubscription(req createSubscriptionRequest) (*Subscription, error) {
+	sub := req.Subscription
 	// 1. Check Top-level Mandatory Attributes
-	if req.NfID == "" {
+	if sub.NfID == "" {
 		return nil, fmt.Errorf("missing mandatory attribute: nfId")
 	}
-	if req.EventNotifyURI == "" {
+	if sub.EventNotifyURI == "" {
 		return nil, fmt.Errorf("missing mandatory attribute: eventNotifyUri")
 	}
-	if req.NotifyCorrelationID == "" {
+	if sub.NotifyCorrelationID == "" {
 		return nil, fmt.Errorf("missing mandatory attribute: notifyCorrelationId")
 	}
 
 	// 2. Validate EventList (Mandatory)
-	if len(req.EventList) == 0 {
+	if len(sub.EventList) == 0 {
 		return nil, fmt.Errorf("missing mandatory attribute: eventList cannot be empty")
 	}
 
@@ -382,7 +243,7 @@ func (server *Server) validateAndBuildSubscription(req createSubscriptionRequest
 	var appIds []string
 	var trafficFilters []FlowInformation
 
-	for _, evt := range req.EventList {
+	for _, evt := range sub.EventList {
 		if evt.Type == "" {
 			return nil, fmt.Errorf("missing mandatory attribute: eventList[].type")
 		}
@@ -441,11 +302,11 @@ func (server *Server) validateAndBuildSubscription(req createSubscriptionRequest
 	}
 
 	// 3. Validate EventReportingMode (Mandatory)
-	if req.EventReportingMode.Trigger == "" {
+	if sub.EventReportingMode.Trigger == "" {
 		return nil, fmt.Errorf("missing mandatory attribute: eventReportingMode.trigger")
 	}
 
-	triggerUpper := strings.ToUpper(req.EventReportingMode.Trigger)
+	triggerUpper := strings.ToUpper(sub.EventReportingMode.Trigger)
 	var chosenMode Mode
 	switch triggerUpper {
 	case "PERIODIC":
@@ -454,10 +315,10 @@ func (server *Server) validateAndBuildSubscription(req createSubscriptionRequest
 		chosenMode = ModeOnDemand
 	default:
 		// To-do: Support other triggers (e.g. THRESHOLD)
-		return nil, fmt.Errorf("not supported yet: trigger %s", req.EventReportingMode.Trigger)
+		return nil, fmt.Errorf("not supported yet: trigger %s", sub.EventReportingMode.Trigger)
 	}
 
-	periodSec := req.EventReportingMode.ReportPeriod
+	periodSec := sub.EventReportingMode.ReportPeriod
 	if periodSec <= 0 {
 		// Fallback for periodic if not specified
 		if chosenMode == ModePeriodic {
@@ -471,22 +332,22 @@ func (server *Server) validateAndBuildSubscription(req createSubscriptionRequest
 	// 4. Validate Targeting (Conditional Attributes)
 	// Must verify one of ueIpAddress or anyUe=true is present.
 	target := TargetScope{}
-	if req.AnyUE {
-		if req.UeIPAddress != "" {
+	if sub.AnyUE {
+		if sub.UeIPAddress != "" {
 			return nil, fmt.Errorf("invalid targeting: cannot specify both anyUe and ueIpAddress")
 		}
 		target.AnyUE = true
-	} else if req.UeIPAddress != "" {
-		target.UeIPAddress = req.UeIPAddress
+	} else if sub.UeIPAddress != "" {
+		target.UeIPAddress = sub.UeIPAddress
 	} else {
 		return nil, fmt.Errorf("missing target: must specify either anyUe=true or provide ueIpAddress")
 	}
 
 	// Build subscription object.
 	newSubscription := &Subscription{
-		NotifURI:            req.EventNotifyURI,
-		NotifyCorrelationID: req.NotifyCorrelationID,
-		NfID:                req.NfID,
+		NotifURI:            sub.EventNotifyURI,
+		NotifyCorrelationID: sub.NotifyCorrelationID,
+		NfID:                sub.NfID,
 		Event:               EventUserDataUsageMeasures,
 		Granularity:         granularity,
 		Mode:                chosenMode,
@@ -501,6 +362,17 @@ func (server *Server) validateAndBuildSubscription(req createSubscriptionRequest
 	return newSubscription, nil
 }
 
+// getAPIRoot helper to construct the base URL from the request.
+// In a real deployment, this might be configured, but using the request Host is a good default.
+func getAPIRoot(r *http.Request) string {
+	scheme := "http"
+	if r.TLS != nil {
+		scheme = "https"
+	}
+	// If behind a proxy, X-Forwarded-Proto might be needed, but keeping it simple for MVP.
+	return fmt.Sprintf("%s://%s", scheme, r.Host)
+}
+
 /*
 Example Subscription Payloads (JSON):
 
@@ -508,67 +380,34 @@ Example Subscription Payloads (JSON):
 curl -X POST http://127.0.0.1:8088/nupf-ee/v1/ee-subscriptions \
   -H 'Content-Type: application/json' \
   -d '{
-    "nfId": "smf-01",
-    "eventList": [{
-      "type": "USER_DATA_USAGE_MEASURES",
-      "measurementTypes": ["VOLUME_MEASUREMENT", "THROUGHPUT_MEASUREMENT"],
-      "granularityOfMeasurement": "PER_SESSION"
-    }],
-    "eventNotifyUri": "http://127.0.0.1:9000/callback",
-    "notifyCorrelationId": "corr-session-001",
-    "eventReportingMode": {"trigger": "PERIODIC", "reportPeriod": 30},
-    "anyUe": true
+    "subscription": {
+      "nfId": "smf-01",
+      "eventList": [{
+        "type": "USER_DATA_USAGE_MEASURES",
+        "measurementTypes": ["VOLUME_MEASUREMENT", "THROUGHPUT_MEASUREMENT"],
+        "granularityOfMeasurement": "PER_SESSION"
+      }],
+      "eventNotifyUri": "http://127.0.0.1:9000/callback",
+      "notifyCorrelationId": "corr-session-001",
+      "eventReportingMode": {"trigger": "PERIODIC", "reportPeriod": 30},
+      "anyUe": true
+    }
   }'
 
-=== 2. PER_APPLICATION (Requires appIds) ===
+=== 2. Specific UE Targeting ===
 curl -X POST http://127.0.0.1:8088/nupf-ee/v1/ee-subscriptions \
   -H 'Content-Type: application/json' \
   -d '{
-    "nfId": "nwdaf-01",
-    "eventList": [{
-      "type": "USER_DATA_USAGE_MEASURES",
-      "measurementTypes": ["VOLUME_MEASUREMENT"],
-      "granularityOfMeasurement": "PER_APPLICATION",
-      "appIds": ["app-youtube", "app-netflix", "app-web"]
-    }],
-    "eventNotifyUri": "http://127.0.0.1:9000/app-usage-callback",
-    "notifyCorrelationId": "corr-app-001",
-    "eventReportingMode": {"trigger": "PERIODIC", "reportPeriod": 60},
-    "anyUe": true
-  }'
-
-=== 3. PER_FLOW (Requires trafficFilters) ===
-curl -X POST http://127.0.0.1:8088/nupf-ee/v1/ee-subscriptions \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "nfId": "pcf-01",
-    "eventList": [{
-      "type": "USER_DATA_USAGE_MEASURES",
-      "measurementTypes": ["VOLUME_MEASUREMENT"],
-      "granularityOfMeasurement": "PER_FLOW",
-      "trafficFilters": [
-        {"flowDescription": "permit in ip from any to 10.0.0.0/8", "flowDirection": "DOWNLINK"},
-        {"flowDescription": "permit out ip from 10.0.0.0/8 to any", "flowDirection": "UPLINK"}
-      ]
-    }],
-    "eventNotifyUri": "http://127.0.0.1:9000/flow-usage-callback",
-    "notifyCorrelationId": "corr-flow-001",
-    "eventReportingMode": {"trigger": "PERIODIC", "reportPeriod": 10},
-    "ueIpAddress": "10.60.0.1"
-  }'
-
-=== 4. Specific UE Targeting (with PER_SESSION) ===
-curl -X POST http://127.0.0.1:8088/nupf-ee/v1/ee-subscriptions \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "nfId": "smf-01",
-    "eventList": [{
-      "type": "USER_DATA_USAGE_MEASURES",
-      "measurementTypes": ["VOLUME_MEASUREMENT"]
-    }],
-    "eventNotifyUri": "http://127.0.0.1:9000/callback",
-    "notifyCorrelationId": "corr-ue-001",
-    "eventReportingMode": {"trigger": "ONE_TIME"},
-    "ueIpAddress": "10.10.0.1"
+    "subscription": {
+      "nfId": "smf-01",
+      "eventList": [{
+        "type": "USER_DATA_USAGE_MEASURES",
+        "measurementTypes": ["VOLUME_MEASUREMENT"]
+      }],
+      "eventNotifyUri": "http://127.0.0.1:9000/callback",
+      "notifyCorrelationId": "corr-ue-001",
+      "eventReportingMode": {"trigger": "ONE_TIME"},
+      "ueIpAddress": "10.10.0.1"
+    }
   }'
 */

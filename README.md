@@ -121,16 +121,18 @@ EES:
 curl -X POST http://127.0.0.1:8088/nupf-ee/v1/ee-subscriptions \
   -H 'Content-Type: application/json' \
   -d '{
-    "nfId": "smf-01",
-    "eventList": [{
-      "type": "USER_DATA_USAGE_MEASURES",
-      "measurementTypes": ["VOLUME_MEASUREMENT", "THROUGHPUT_MEASUREMENT"],
-      "granularityOfMeasurement": "PER_SESSION"
-    }],
-    "eventNotifyUri": "http://127.0.0.1:9000/callback",
-    "notifyCorrelationId": "corr-session-001",
-    "eventReportingMode": {"trigger": "PERIODIC", "reportPeriod": 30},
-    "anyUe": true
+    "subscription": {
+      "nfId": "smf-01",
+      "eventList": [{
+        "type": "USER_DATA_USAGE_MEASURES",
+        "measurementTypes": ["VOLUME_MEASUREMENT", "THROUGHPUT_MEASUREMENT"],
+        "granularityOfMeasurement": "PER_SESSION"
+      }],
+      "eventNotifyUri": "http://127.0.0.1:9000/callback",
+      "notifyCorrelationId": "corr-session-001",
+      "eventReportingMode": {"trigger": "PERIODIC", "reportPeriod": 30},
+      "anyUe": true
+    }
   }'
 ```
 
@@ -140,17 +142,19 @@ curl -X POST http://127.0.0.1:8088/nupf-ee/v1/ee-subscriptions \
 curl -X POST http://127.0.0.1:8088/nupf-ee/v1/ee-subscriptions \
   -H 'Content-Type: application/json' \
   -d '{
-    "nfId": "nwdaf-01",
-    "eventList": [{
-      "type": "USER_DATA_USAGE_MEASURES",
-      "measurementTypes": ["VOLUME_MEASUREMENT"],
-      "granularityOfMeasurement": "PER_APPLICATION",
-      "appIds": ["app-youtube", "app-netflix"]
-    }],
-    "eventNotifyUri": "http://127.0.0.1:9000/callback",
-    "notifyCorrelationId": "corr-app-001",
-    "eventReportingMode": {"trigger": "PERIODIC", "reportPeriod": 60},
-    "anyUe": true
+    "subscription": {
+      "nfId": "nwdaf-01",
+      "eventList": [{
+        "type": "USER_DATA_USAGE_MEASURES",
+        "measurementTypes": ["VOLUME_MEASUREMENT"],
+        "granularityOfMeasurement": "PER_APPLICATION",
+        "appIds": ["app-youtube", "app-netflix"]
+      }],
+      "eventNotifyUri": "http://127.0.0.1:9000/callback",
+      "notifyCorrelationId": "corr-app-001",
+      "eventReportingMode": {"trigger": "PERIODIC", "reportPeriod": 60},
+      "anyUe": true
+    }
   }'
 ```
 
@@ -160,19 +164,21 @@ curl -X POST http://127.0.0.1:8088/nupf-ee/v1/ee-subscriptions \
 curl -X POST http://127.0.0.1:8088/nupf-ee/v1/ee-subscriptions \
   -H 'Content-Type: application/json' \
   -d '{
-    "nfId": "pcf-01",
-    "eventList": [{
-      "type": "USER_DATA_USAGE_MEASURES",
-      "measurementTypes": ["VOLUME_MEASUREMENT"],
-      "granularityOfMeasurement": "PER_FLOW",
-      "trafficFilters": [
-        {"flowDescription": "permit in ip from any to 10.0.0.0/8", "flowDirection": "DOWNLINK"}
-      ]
-    }],
-    "eventNotifyUri": "http://127.0.0.1:9000/callback",
-    "notifyCorrelationId": "corr-flow-001",
-    "eventReportingMode": {"trigger": "PERIODIC", "reportPeriod": 10},
-    "ueIpAddress": "10.60.0.1"
+    "subscription": {
+      "nfId": "pcf-01",
+      "eventList": [{
+        "type": "USER_DATA_USAGE_MEASURES",
+        "measurementTypes": ["VOLUME_MEASUREMENT"],
+        "granularityOfMeasurement": "PER_FLOW",
+        "trafficFilters": [
+          {"flowDescription": "permit in ip from any to 10.0.0.0/8", "flowDirection": "DOWNLINK"}
+        ]
+      }],
+      "eventNotifyUri": "http://127.0.0.1:9000/callback",
+      "notifyCorrelationId": "corr-flow-001",
+      "eventReportingMode": {"trigger": "PERIODIC", "reportPeriod": 10},
+      "ueIpAddress": "10.60.0.1"
+    }
   }'
 ```
 
@@ -182,15 +188,17 @@ curl -X POST http://127.0.0.1:8088/nupf-ee/v1/ee-subscriptions \
 curl -X POST http://127.0.0.1:8088/nupf-ee/v1/ee-subscriptions \
   -H 'Content-Type: application/json' \
   -d '{
-    "nfId": "smf-01",
-    "eventList": [{
-      "type": "USER_DATA_USAGE_MEASURES",
-      "measurementTypes": ["VOLUME_MEASUREMENT"]
-    }],
-    "eventNotifyUri": "http://127.0.0.1:9000/callback",
-    "notifyCorrelationId": "corr-onetime-001",
-    "eventReportingMode": {"trigger": "ONE_TIME"},
-    "ueIpAddress": "10.60.0.1"
+    "subscription": {
+      "nfId": "smf-01",
+      "eventList": [{
+        "type": "USER_DATA_USAGE_MEASURES",
+        "measurementTypes": ["VOLUME_MEASUREMENT"]
+      }],
+      "eventNotifyUri": "http://127.0.0.1:9000/callback",
+      "notifyCorrelationId": "corr-onetime-001",
+      "eventReportingMode": {"trigger": "ONE_TIME"},
+      "ueIpAddress": "10.60.0.1"
+    }
   }'
 ```
 
