@@ -118,11 +118,11 @@ func (notifier *Notifier) Notify(subscription *Subscription, measures []UsageMea
 				}
 			}
 
-			// Conditionally add Throughput Statistics Measurement
+			// Conditionally add Throughput Measurement
 			if subscription.HasMeasurementType(MeasureThroughput) {
-				measurement.ThroughputStatisticsMeasurement = &ThroughputStatisticsMeasurement{
-					UlAverageThroughput: fmt.Sprintf("%.0f bps", m.ULThroughputBps),
-					DlAverageThroughput: fmt.Sprintf("%.0f bps", m.DLThroughputBps),
+				measurement.ThroughputMeasurement = &ThroughputMeasurement{
+					UlThroughput: fmt.Sprintf("%.0f bps", m.ULThroughputBps),
+					DlThroughput: fmt.Sprintf("%.0f bps", m.DLThroughputBps),
 				}
 			}
 
