@@ -1,6 +1,8 @@
 package app
 
 import (
+	"fmt"
+
 	"github.com/free5gc/go-upf/internal/report"
 )
 
@@ -25,46 +27,26 @@ func (d *Dispatcher) RegisterEESHandler(handler report.Handler) {
 	d.eesHandler = handler
 }
 
-// NotifySessReport multicasts the report to all registered handlers based on URR ID range.
+// NotifySessReport multicasts the report to all registered handlers.
+// Pure Push Mode: All USAReports are forwarded to both handlers.
+// - PFCP handler: forwards to SMF (N4)
+// - EES handler: aggregates for event exposure (filters URRID >= 7 internally)
 func (d *Dispatcher) NotifySessReport(sessRpt report.SessReport) {
-	var pfcpReports []report.Report
-	var eesReports []report.Report
+	// Debug: Log incoming report
+	// Using fmt since we don't have a logger here
+	fmt.Printf("[Dispatcher] NotifySessReport: SEID=%#x, ReportCount=%d\n", sessRpt.SEID, len(sessRpt.Reports))
 
-	for _, r := range sessRpt.Reports {
-		// Identify if this report is for EES (Shadow URR) or SMF (Standard URR)
-		isEES := false
-		if r.Type() == report.USAR {
-			if usar, ok := r.(report.USAReport); ok {
-				// Check against Shadow Range (Hardcoded or imported? Imported is better)
-				// Using ees.ShadowUrrMin/Max requires import.
-				// Let's assume range 20000+ for now as per requirement.
-				if usar.URRID >= 20000 {
-					isEES = true
-				}
-			}
-		}
-
-		if isEES {
-			eesReports = append(eesReports, r)
-		} else {
-			pfcpReports = append(pfcpReports, r)
-		}
+	// Dispatch to PFCP (N4) - all reports
+	if d.pfcpHandler != nil {
+		d.pfcpHandler.NotifySessReport(sessRpt)
 	}
 
-	// Dispatch to PFCP (N4)
-	if len(pfcpReports) > 0 && d.pfcpHandler != nil {
-		d.pfcpHandler.NotifySessReport(report.SessReport{
-			SEID:    sessRpt.SEID,
-			Reports: pfcpReports,
-		})
-	}
-
-	// Dispatch to EES
-	if len(eesReports) > 0 && d.eesHandler != nil {
-		d.eesHandler.NotifySessReport(report.SessReport{
-			SEID:    sessRpt.SEID,
-			Reports: eesReports,
-		})
+	// Dispatch to EES - all reports (EES aggregator filters by URRID >= 7)
+	if d.eesHandler != nil {
+		fmt.Printf("[Dispatcher] Forwarding to EES handler\n")
+		d.eesHandler.NotifySessReport(sessRpt)
+	} else {
+		fmt.Printf("[Dispatcher] WARNING: eesHandler is nil!\n")
 	}
 }
 

@@ -94,6 +94,9 @@ func (aggregator *Aggregator) Run(parentContext context.Context) {
 
 // TickOnce sends notifications using accumulated reports from the Push buffer.
 // This is the Pure Push model - no active polling.
+// Reports for the same session are consolidated into a single report.
+// Each subscription's reportPeriod is respected - notifications are only sent
+// when enough time has passed since the last notification.
 // Returns number of notifications attempted (sum over all subscriptions) and any error.
 func (aggregator *Aggregator) TickOnce(ctx context.Context) (int, error) {
 	_ = ctx // ctx reserved for future cancellation support
@@ -101,10 +104,13 @@ func (aggregator *Aggregator) TickOnce(ctx context.Context) (int, error) {
 	now := time.Now()
 	totalNotifications := 0
 
-	// Lock and swap out the buffer
+	// Lock and swap out the buffer to process current batch
+	// This prevents memory leak by clearing the buffer after taking a snapshot
 	aggregator.mu.Lock()
 	bufferedReports := aggregator.reportBuffer
 	aggregator.reportBuffer = make(map[string][]UsageMeasures)
+	// Create a new buffer for reports that should be kept (period not elapsed)
+	newBuffer := make(map[string][]UsageMeasures)
 	aggregator.mu.Unlock()
 
 	// Iterate over all subscriptions
@@ -125,54 +131,194 @@ func (aggregator *Aggregator) TickOnce(ctx context.Context) (int, error) {
 		// Get accumulated reports for this subscription
 		usageMeasuresList, hasReports := bufferedReports[subscription.ID]
 
+		if !hasReports || len(usageMeasuresList) == 0 {
+			continue
+		}
+
+		// Check if enough time has passed since last notification (respect subscription's reportPeriod)
+		// For ON_DEMAND mode, always send immediately
+		if subscription.Mode == ModePeriodic {
+			periodDuration := time.Duration(subscription.PeriodSec) * time.Second
+			timeSinceLastNotify := now.Sub(subscription.LastNotify)
+
+			if timeSinceLastNotify < periodDuration {
+				// Not time to notify yet - keep reports in buffer for next tick
+				aggregator.mu.Lock()
+				newBuffer[subscription.ID] = append(newBuffer[subscription.ID], usageMeasuresList...)
+				aggregator.mu.Unlock()
+
+				aggregator.logger.Debug("ees skipping notification - period not elapsed",
+					zap.String("subscriptionId", subscription.ID),
+					zap.Duration("elapsed", timeSinceLastNotify),
+					zap.Duration("period", periodDuration),
+					zap.Int("bufferedReports", len(usageMeasuresList)),
+				)
+				continue
+			}
+		}
+
+		// Consolidate reports: merge multiple reports for the same session
+		consolidatedList := consolidateReports(usageMeasuresList)
+
+		aggregator.logger.Info("ees consolidation result",
+			zap.String("subscriptionId", subscription.ID),
+			zap.Int("beforeCount", len(usageMeasuresList)),
+			zap.Int("afterCount", len(consolidatedList)),
+		)
+
 		if subscription.Mode == ModeOnDemand {
-			if hasReports && len(usageMeasuresList) > 0 {
-				if err := aggregator.notifier.Notify(subscription, usageMeasuresList); err != nil {
-					aggregator.logger.Warn("ees notify (on-demand) failed",
-						zap.String("subscriptionId", subscription.ID),
-						zap.Error(err),
-						zap.Int("items", len(usageMeasuresList)),
-					)
-				} else {
-					totalNotifications++
-					subscription.LastNotify = now
-					aggregator.logger.Debug("ees notify (on-demand) success",
-						zap.String("subscriptionId", subscription.ID),
-						zap.Int("items", len(usageMeasuresList)),
-					)
-				}
+			if err := aggregator.notifier.Notify(subscription, consolidatedList); err != nil {
+				aggregator.logger.Warn("ees notify (on-demand) failed",
+					zap.String("subscriptionId", subscription.ID),
+					zap.Error(err),
+					zap.Int("items", len(consolidatedList)),
+				)
+			} else {
+				totalNotifications++
+				subscription.LastNotify = now
+				aggregator.logger.Debug("ees notify (on-demand) success",
+					zap.String("subscriptionId", subscription.ID),
+					zap.Int("items", len(consolidatedList)),
+				)
 			}
 			// Switch to Periodic after OnDemand processing
 			subscription.Mode = ModePeriodic
 			continue
 		}
 
-		// PERIODIC mode
-		if hasReports && len(usageMeasuresList) > 0 {
-			if err := aggregator.notifier.Notify(subscription, usageMeasuresList); err != nil {
-				aggregator.logger.Warn("ees notify (periodic) failed",
-					zap.String("subscriptionId", subscription.ID),
-					zap.Error(err),
-					zap.Int("items", len(usageMeasuresList)),
-				)
-			} else {
-				totalNotifications++
-				subscription.LastNotify = now
-				aggregator.logger.Debug("ees notify (periodic) success",
-					zap.String("subscriptionId", subscription.ID),
-					zap.Int("items", len(usageMeasuresList)),
-				)
-			}
+		// PERIODIC mode - send notification
+		if err := aggregator.notifier.Notify(subscription, consolidatedList); err != nil {
+			aggregator.logger.Warn("ees notify (periodic) failed",
+				zap.String("subscriptionId", subscription.ID),
+				zap.Error(err),
+				zap.Int("items", len(consolidatedList)),
+			)
+		} else {
+			totalNotifications++
+			subscription.LastNotify = now
+			aggregator.logger.Info("ees notify (periodic) success",
+				zap.String("subscriptionId", subscription.ID),
+				zap.Int("items", len(consolidatedList)),
+				zap.Int("periodSec", subscription.PeriodSec),
+			)
 		}
 	}
+
+	// Update the buffer with reports that were kept (for subscriptions whose period hasn't elapsed)
+	aggregator.mu.Lock()
+	for subID, reports := range newBuffer {
+		aggregator.reportBuffer[subID] = append(aggregator.reportBuffer[subID], reports...)
+	}
+	aggregator.mu.Unlock()
 
 	aggregator.lastSnapshotTime = now
 	return totalNotifications, nil
 }
 
+// consolidateReports merges multiple UsageMeasures for the same session into one.
+// For each unique SessionKey, it produces a single consolidated report.
+// Since Source (Kernel) reports are Cumulative (Total Volume), we must NOT sum them.
+// Instead, we take the counters from the report with the latest EndTime (most recent snapshot).
+// StartTime is set to the earliest StartTime seen in the batch.
+// EndTime is set to the latest EndTime seen in the batch.
+func consolidateReports(reports []UsageMeasures) []UsageMeasures {
+	if len(reports) <= 1 {
+		return reports
+	}
+
+	// Map by SessionKey for consolidation
+	consolidated := make(map[SessionKey]*UsageMeasures)
+
+	for _, r := range reports {
+		existing, ok := consolidated[r.Key]
+		if !ok {
+			// First occurrence - create a copy
+			copy := r
+			consolidated[r.Key] = &copy
+			continue
+		}
+
+		// Update logic for Cumulative Counters:
+		// We want the counters from the latest report (latest EndTime).
+		// We also want to track the full time window (Min Start, Max End).
+
+		// 1. Maintain the widest time window
+		if r.StartTime.Before(existing.StartTime) {
+			existing.StartTime = r.StartTime
+		}
+		if r.EndTime.After(existing.EndTime) {
+			existing.EndTime = r.EndTime
+		}
+
+		// 2. Update Volume/Packet counters to the latest snapshot values
+		// Assumption: Counters are monotonic increasing. Max value == Latest value.
+		// Using strict "Latest Time" is safer if counters can be reset, but max is good for robustness against out-of-order.
+		// Here we simply check if 'r' is newer than what we have stored as the "source of truth" for counters.
+		// Since 'existing' is modifying EndTime, we validly compare r.ULBytesDelta > existing.ULBytesDelta
+		// OR we can rely on r.EndTime being the indicator.
+		// Let's use Max(Volume) to be safe for cumulative counters.
+
+		if r.ULBytesDelta > existing.ULBytesDelta {
+			existing.ULBytesDelta = r.ULBytesDelta
+		}
+		if r.DLBytesDelta > existing.DLBytesDelta {
+			existing.DLBytesDelta = r.DLBytesDelta
+		}
+		if r.ULPacketsDelta > existing.ULPacketsDelta {
+			existing.ULPacketsDelta = r.ULPacketsDelta
+		}
+		if r.DLPacketsDelta > existing.DLPacketsDelta {
+			existing.DLPacketsDelta = r.DLPacketsDelta
+		}
+	}
+
+	// Convert map back to slice and recompute throughput
+	result := make([]UsageMeasures, 0, len(consolidated))
+	for _, m := range consolidated {
+		computeThroughputIfPossible(m)
+		result = append(result, *m)
+	}
+
+	return result
+}
+
 // PushReport handles unsolicited reports (e.g. from Kernel via Handler).
 // Reports are accumulated in reportBuffer and sent during the next TickOnce().
+// New logic: Aggregate all SMF URRs per session (no Shadow URR filtering).
 func (aggregator *Aggregator) PushReport(sessRpt report.SessReport) {
+	// Debug: Log all incoming reports
+	aggregator.logger.Info("PushReport called",
+		zap.Uint64("seid", sessRpt.SEID),
+		zap.Int("totalReports", len(sessRpt.Reports)),
+	)
+	for i, r := range sessRpt.Reports {
+		if r.Type() == report.USAR {
+			if usarep, ok := r.(report.USAReport); ok {
+				aggregator.logger.Info("PushReport - USAReport details",
+					zap.Int("index", i),
+					zap.Uint32("urrid", usarep.URRID),
+					zap.Uint64("ulBytes", usarep.VolumMeasure.UplinkVolume),
+					zap.Uint64("dlBytes", usarep.VolumMeasure.DownlinkVolume),
+				)
+			}
+		}
+	}
+
+	// Get session context for UE IP lookup
+	var ueIpv4Addr string
+	if aggregator.sessionProvider != nil {
+		contexts := aggregator.sessionProvider.GetSessionContexts()
+		if ctx, ok := contexts[sessRpt.SEID]; ok {
+			ueIpv4Addr = ctx.UeIPv4Addr
+		}
+	}
+
+	// Aggregate all USAReports in this session (full summation)
+	var totalUL, totalDL, totalULPkt, totalDLPkt uint64
+	var startTime, endTime time.Time
+	var urrIDs []uint32
+	reportCount := 0
+
 	for _, r := range sessRpt.Reports {
 		if r.Type() != report.USAR {
 			continue
@@ -182,63 +328,93 @@ func (aggregator *Aggregator) PushReport(sessRpt report.SessReport) {
 			continue
 		}
 
-		// Iterate subscriptions to see if this report is relevant
-		subscriptions := aggregator.subscriptionStore.AllSubscriptions()
-		for _, sub := range subscriptions {
-			// Check Shadow URR ID match
-			if sub.ShadowURRID != usarep.URRID {
-				continue
-			}
-
-			// Build UsageMeasure
-			m := UsageMeasures{
-				Key: SessionKey{LocalSEID: sessRpt.SEID},
-				// Note: RemoteSEID is unknown here without lookup.
-				ULBytesDelta:   usarep.VolumMeasure.UplinkVolume,
-				DLBytesDelta:   usarep.VolumMeasure.DownlinkVolume,
-				ULPacketsDelta: usarep.VolumMeasure.UplinkPktNum,
-				DLPacketsDelta: usarep.VolumMeasure.DownlinkPktNum,
-				StartTime:      usarep.StartTime,
-				EndTime:        usarep.EndTime,
-			}
-
-			// Populate UE IP from SessionContext and log source PDRs
-			var contributingPDRs []uint16
-			if aggregator.sessionProvider != nil {
-				contexts := aggregator.sessionProvider.GetSessionContexts()
-				if ctx, ok := contexts[sessRpt.SEID]; ok {
-					m.UeIpv4Addr = ctx.UeIPv4Addr
-
-					// Find PDRs associated with this URR
-					for _, pdr := range ctx.PDRs {
-						for _, uid := range pdr.URRIDs {
-							if uid == usarep.URRID {
-								contributingPDRs = append(contributingPDRs, pdr.PDRID)
-								break
-							}
-						}
-					}
-				}
-			}
-
-			// Compute Throughput
-			computeThroughputIfPossible(&m)
-
-			// Accumulate to buffer (will be sent in TickOnce)
-			aggregator.mu.Lock()
-			aggregator.reportBuffer[sub.ID] = append(aggregator.reportBuffer[sub.ID], m)
-			aggregator.mu.Unlock()
-
-			aggregator.logger.Info("ees shadow urr report received",
-				zap.String("subscriptionId", sub.ID),
-				zap.Uint32("shadowURRId", sub.ShadowURRID), // Log Shadow ID
-				zap.Uint64("seid", sessRpt.SEID),
-				zap.Uint64("ulBytes", m.ULBytesDelta),
-				zap.Uint64("dlBytes", m.DLBytesDelta),
-				zap.Uint16s("sourcePDRs", contributingPDRs),
-			)
+		// Filter: Only aggregate Charging URRs (ID >= 7)
+		// IDs 1-6 are reserved for QoS Enforcement (MBQE/MAQE) and should not be counted for billing.
+		if usarep.URRID < 7 {
+			continue
 		}
+
+		// Aggregate volumes from all URRs
+		totalUL += usarep.VolumMeasure.UplinkVolume
+		totalDL += usarep.VolumMeasure.DownlinkVolume
+		totalULPkt += usarep.VolumMeasure.UplinkPktNum
+		totalDLPkt += usarep.VolumMeasure.DownlinkPktNum
+
+		// Track time range: earliest StartTime, latest EndTime
+		if reportCount == 0 || usarep.StartTime.Before(startTime) {
+			startTime = usarep.StartTime
+		}
+		if reportCount == 0 || usarep.EndTime.After(endTime) {
+			endTime = usarep.EndTime
+		}
+
+		urrIDs = append(urrIDs, usarep.URRID)
+		reportCount++
 	}
+
+	// No usage reports to process
+	if reportCount == 0 {
+		return
+	}
+
+	// Build aggregated measure for this session
+	m := UsageMeasures{
+		Key:            SessionKey{LocalSEID: sessRpt.SEID},
+		ULBytesDelta:   totalUL,
+		DLBytesDelta:   totalDL,
+		ULPacketsDelta: totalULPkt,
+		DLPacketsDelta: totalDLPkt,
+		StartTime:      startTime,
+		EndTime:        endTime,
+		UeIpv4Addr:     ueIpv4Addr,
+	}
+	computeThroughputIfPossible(&m)
+
+	// Match to subscriptions by target scope
+	subscriptions := aggregator.subscriptionStore.AllSubscriptions()
+	for _, sub := range subscriptions {
+		if !aggregator.matchesSubscription(sub, ueIpv4Addr) {
+			continue
+		}
+
+		// Accumulate to buffer (will be sent in TickOnce)
+		aggregator.mu.Lock()
+		aggregator.reportBuffer[sub.ID] = append(aggregator.reportBuffer[sub.ID], m)
+		aggregator.mu.Unlock()
+
+		aggregator.logger.Info("ees smf urr report captured",
+			zap.String("subscriptionId", sub.ID),
+			zap.Uint64("seid", sessRpt.SEID),
+			zap.String("ueIp", ueIpv4Addr),
+			zap.Uint64("ulBytes", totalUL),
+			zap.Uint64("dlBytes", totalDL),
+			zap.Uint64("ulPackets", totalULPkt),
+			zap.Uint64("dlPackets", totalDLPkt),
+			zap.Int("urrCount", reportCount),
+			zap.Uint32s("urrIDs", urrIDs),
+		)
+	}
+}
+
+// matchesSubscription checks if a session report matches the subscription's target scope.
+func (aggregator *Aggregator) matchesSubscription(sub *Subscription, ueIpv4Addr string) bool {
+	// Check granularity - only PER_SESSION is fully supported
+	if sub.Granularity != GranularityPerSession {
+		aggregator.logger.Warn("ees granularity not supported, skipping",
+			zap.String("subscriptionId", sub.ID),
+			zap.String("granularity", string(sub.Granularity)),
+		)
+		return false
+	}
+
+	// Match target scope
+	if sub.Target.AnyUE {
+		return true
+	}
+	if sub.Target.UeIPAddress != "" && sub.Target.UeIPAddress == ueIpv4Addr {
+		return true
+	}
+	return false
 }
 
 // computeUsageMeasuresFromCurrent uses the provider's current counters as-is (interval semantics)

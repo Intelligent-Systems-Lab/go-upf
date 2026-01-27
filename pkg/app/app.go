@@ -201,21 +201,12 @@ func (u *UpfApp) Run() error {
 		// 4. Start Aggregator (processes buffered reports periodically)
 		go aggregator.Run(u.ctx)
 
-		// 5. Provisioner for creating Shadow URRs via PFCP Session context
-		// Wrap LocalNode.Sess() to convert *pfcp.Sess to ees.PFCPSess interface
-		sessGetter := func(lSeid uint64) (ees.PFCPSess, error) {
-			return localNode.Sess(lSeid)
-		}
-		sessProvider := ees.NewLocalNodeAdapter(sessGetter, localNode)
-		provisioner := ees.NewProvisioner(sessProvider)
-		// Session provider for "Any UE" broadcast provisioning
-		idManager := ees.NewIDManager()
-
+		// 5. Start API Server (simplified - no Shadow URR provisioning)
 		listenAddr := u.cfg.EES.ListenAddr
 		if listenAddr == "" {
 			listenAddr = ":8088"
 		}
-		apiServer := ees.NewServer(subscriptionStore, aggregator, provisioner, sessionProvider, idManager, eesLogger)
+		apiServer := ees.NewServer(subscriptionStore, aggregator, eesLogger)
 
 		go func() {
 			if err := apiServer.Serve(listenAddr); err != nil {
@@ -223,7 +214,7 @@ func (u *UpfApp) Run() error {
 			}
 		}()
 
-		logger.MainLog.Infof("EES started at %s with period %ds (Pure Push Mode)", listenAddr, period)
+		logger.MainLog.Infof("EES started at %s with period %ds (Pure Push Mode - SMF URR)", listenAddr, period)
 	}
 	// =========================================================================
 
