@@ -170,9 +170,6 @@ type Subscription struct {
 	CreatedAt  time.Time
 	LastNotify time.Time
 
-	// ShadowURRID is the internal URR ID allocated for this subscription.
-	ShadowURRID uint32
-
 	// Snapshots keeps the last seen per-session counters for delta computation.
 	// Key: SessionKey (LocalSEID, RemoteSEID)
 	// Val: last counters over [StartTime, EndTime]
