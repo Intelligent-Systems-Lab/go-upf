@@ -25,6 +25,7 @@ type UserDataUsageMeasurements struct {
 	FlowInfo *FlowInformation `json:"flowInfo,omitempty"` // For PER_FLOW granularity
 
 	VolumeMeasurement               *VolumeMeasurement               `json:"volumeMeasurement,omitempty"`
+	ThroughputMeasurement           *ThroughputMeasurement           `json:"throughputMeasurement,omitempty"`
 	ThroughputStatisticsMeasurement *ThroughputStatisticsMeasurement `json:"throughputStatisticsMeasurement,omitempty"`
 }
 
@@ -42,6 +43,14 @@ type VolumeMeasurement struct {
 	TotalNbOfPackets uint64 `json:"totalNbOfPackets,omitempty"`
 	UlNbOfPackets    uint64 `json:"ulNbOfPackets,omitempty"`
 	DlNbOfPackets    uint64 `json:"dlNbOfPackets,omitempty"`
+}
+
+// ThroughputMeasurement per TS 29.564 schema.
+type ThroughputMeasurement struct {
+	UlThroughput       string `json:"ulThroughput,omitempty"`       // BitRate
+	DlThroughput       string `json:"dlThroughput,omitempty"`       // BitRate
+	UlPacketThroughput string `json:"ulPacketThroughput,omitempty"` // PacketRate
+	DlPacketThroughput string `json:"dlPacketThroughput,omitempty"` // PacketRate
 }
 
 // ThroughputStatisticsMeasurement per TS 29.564 schema.
