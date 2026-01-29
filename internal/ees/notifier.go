@@ -102,7 +102,8 @@ func (notifier *Notifier) Notify(subscription *Subscription, measures []UsageMea
 			StartTime:  &m.StartTime,
 		}
 
-		if subscription.Event == EventUserDataUsageMeasures {
+		switch subscription.Event {
+		case EventUserDataUsageMeasures:
 			// Build UserDataUsageMeasurements per TS 29.564
 			measurement := UserDataUsageMeasurements{}
 
@@ -127,7 +128,7 @@ func (notifier *Notifier) Notify(subscription *Subscription, measures []UsageMea
 			}
 
 			item.UserDataUsageMeasurements = []UserDataUsageMeasurements{measurement}
-		} else if subscription.Event == EventUserDataUsageTrends {
+		case EventUserDataUsageTrends:
 			// Trends event: only throughput statistics
 			measurement := UserDataUsageMeasurements{
 				ThroughputStatisticsMeasurement: &ThroughputStatisticsMeasurement{

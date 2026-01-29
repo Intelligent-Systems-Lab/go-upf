@@ -141,7 +141,11 @@ func (aggregator *Aggregator) TickOnce(ctx context.Context) (int, error) {
 			periodDuration := time.Duration(subscription.PeriodSec) * time.Second
 			timeSinceLastNotify := now.Sub(subscription.LastNotify)
 
-			if timeSinceLastNotify < periodDuration {
+			// Add small tolerance (100ms) to avoid timer precision issues
+			// This prevents delays due to minor timing variations (e.g., 29.98s being treated as < 30s)
+			const tolerance = 100 * time.Millisecond
+
+			if timeSinceLastNotify+tolerance < periodDuration {
 				// Not time to notify yet - keep reports in buffer for next tick
 				aggregator.mu.Lock()
 				newBuffer[subscription.ID] = append(newBuffer[subscription.ID], usageMeasuresList...)
@@ -217,8 +221,8 @@ func (aggregator *Aggregator) TickOnce(ctx context.Context) (int, error) {
 
 // consolidateReports merges multiple UsageMeasures for the same session into one.
 // For each unique SessionKey, it produces a single consolidated report.
-// Since Source (Kernel) reports are Cumulative (Total Volume), we must NOT sum them.
-// Instead, we take the counters from the report with the latest EndTime (most recent snapshot).
+// For Periodic triggers (URR 1/2), each report is an INCREMENTAL value for that period,
+// so we MUST SUM them to get the total usage across multiple periods.
 // StartTime is set to the earliest StartTime seen in the batch.
 // EndTime is set to the latest EndTime seen in the batch.
 func consolidateReports(reports []UsageMeasures) []UsageMeasures {
@@ -238,9 +242,9 @@ func consolidateReports(reports []UsageMeasures) []UsageMeasures {
 			continue
 		}
 
-		// Update logic for Cumulative Counters:
-		// We want the counters from the latest report (latest EndTime).
-		// We also want to track the full time window (Min Start, Max End).
+		// Update logic for Periodic Incremental Reports:
+		// Each report represents usage in a specific time period (e.g., 5 seconds).
+		// We need to SUM all reports to get total usage across multiple periods.
 
 		// 1. Maintain the widest time window
 		if r.StartTime.Before(existing.StartTime) {
@@ -250,26 +254,13 @@ func consolidateReports(reports []UsageMeasures) []UsageMeasures {
 			existing.EndTime = r.EndTime
 		}
 
-		// 2. Update Volume/Packet counters to the latest snapshot values
-		// Assumption: Counters are monotonic increasing. Max value == Latest value.
-		// Using strict "Latest Time" is safer if counters can be reset, but max is good for robustness against out-of-order.
-		// Here we simply check if 'r' is newer than what we have stored as the "source of truth" for counters.
-		// Since 'existing' is modifying EndTime, we validly compare r.ULBytesDelta > existing.ULBytesDelta
-		// OR we can rely on r.EndTime being the indicator.
-		// Let's use Max(Volume) to be safe for cumulative counters.
-
-		if r.ULBytesDelta > existing.ULBytesDelta {
-			existing.ULBytesDelta = r.ULBytesDelta
-		}
-		if r.DLBytesDelta > existing.DLBytesDelta {
-			existing.DLBytesDelta = r.DLBytesDelta
-		}
-		if r.ULPacketsDelta > existing.ULPacketsDelta {
-			existing.ULPacketsDelta = r.ULPacketsDelta
-		}
-		if r.DLPacketsDelta > existing.DLPacketsDelta {
-			existing.DLPacketsDelta = r.DLPacketsDelta
-		}
+		// 2. Sum Volume/Packet counters (not max!)
+		// Periodic triggers provide incremental values that must be summed.
+		// Example: Report1(0-5s)=1000 bytes + Report2(5-10s)=800 bytes = 1800 bytes total
+		existing.ULBytesDelta += r.ULBytesDelta
+		existing.DLBytesDelta += r.DLBytesDelta
+		existing.ULPacketsDelta += r.ULPacketsDelta
+		existing.DLPacketsDelta += r.DLPacketsDelta
 	}
 
 	// Convert map back to slice and recompute throughput
@@ -313,7 +304,7 @@ func (aggregator *Aggregator) PushReport(sessRpt report.SessReport) {
 		}
 	}
 
-	// Aggregate all USAReports in this session (full summation)
+	// Use URR 2 (MAQE) as the single source for PER_PDU_SESSION measurements
 	var totalUL, totalDL, totalULPkt, totalDLPkt uint64
 	var startTime, endTime time.Time
 	var urrIDs []uint32
@@ -328,9 +319,10 @@ func (aggregator *Aggregator) PushReport(sessRpt report.SessReport) {
 			continue
 		}
 
-		// Filter: Only aggregate Charging URRs (ID >= 7)
-		// IDs 1-6 are reserved for QoS Enforcement (MBQE/MAQE) and should not be counted for billing.
-		if usarep.URRID < 7 {
+		// Filter: Only use URR 2 (N3N6_MAQE - Measurement After QoS Enforcement)
+		// URR 2 represents actual transmitted traffic for the entire PDU session
+		// This is the perfect source for PER_PDU_SESSION granularity measurements
+		if usarep.URRID != 2 {
 			continue
 		}
 
