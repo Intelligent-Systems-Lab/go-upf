@@ -171,7 +171,11 @@ func (u *UpfApp) Run() error {
 		logger.MainLog.Infoln("Starting EES Module (Pure Push Mode)...")
 
 		// 1. Create Logger
-		eesLogger, _ := zap.NewDevelopment() // Simple error handling
+		eesLogger, err := zap.NewDevelopment()
+		if err != nil {
+			logger.MainLog.Warnf("Failed to create EES logger: %v", err)
+			eesLogger = zap.NewNop() // Fallback to no-op logger
+		}
 
 		// 2. Create Store / Notifier / Aggregator (no ActivePFCPSource needed for Push mode)
 		subscriptionStore := ees.NewSubscriptionStore("")

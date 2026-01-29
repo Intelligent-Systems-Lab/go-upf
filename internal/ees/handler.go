@@ -1,8 +1,9 @@
 package ees
 
 import (
-	"github.com/free5gc/go-upf/internal/report"
 	"go.uber.org/zap"
+
+	"github.com/free5gc/go-upf/internal/report"
 )
 
 // Handler implements report.Handler for the EES module.

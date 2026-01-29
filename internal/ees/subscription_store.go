@@ -75,7 +75,7 @@ func (store *SubscriptionStore) CreateSubscription(newSubscription *Subscription
 	// initialize internal bookkeeping fields
 	newSubscription.ID = subscriptionID
 	newSubscription.CreatedAt = now
-	newSubscription.LastNotify = time.Time{} // zero means "never"
+	newSubscription.LastNotify = now // Initialize to now to avoid time overflow
 	if newSubscription.Snapshots == nil {
 		newSubscription.Snapshots = make(map[SessionKey]Counters)
 	}
