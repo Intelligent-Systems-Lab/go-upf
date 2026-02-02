@@ -31,7 +31,31 @@ This repository implements the **Nupf_EventExposure** service for `go-upf` per *
 | `ueIpAddress` | ✅ Supported | Specific UE |
 | `supi` / `gpsi` | ❌ Not Implemented | |
 
+### Subscription Response Example
+
+When a subscription is created successfully, the API returns `201 Created` with a `Location` header and the following JSON body:
+
+```json
+{
+  "subscriptionId": "sub-1738483200000000000-0000",
+  "subscription": {
+    "nfId": "smf-01",
+    "eventList": [{
+      "type": "USER_DATA_USAGE_MEASURES",
+      "measurementTypes": ["VOLUME_MEASUREMENT", "THROUGHPUT_MEASUREMENT"],
+      "granularityOfMeasurement": "PER_SESSION"
+    }],
+    "eventNotifyUri": "http://127.0.0.1:9000/callback",
+    "notifyCorrelationId": "corr-session-001",
+    "eventReportingMode": {"trigger": "PERIODIC", "reportPeriod": 30},
+    "anyUe": true
+  }
+}
+```
+
 ### Notification Payload (TS 29.564 Compliant)
+
+The notification is sent as HTTP POST to the `eventNotifyUri`:
 
 ```json
 {
@@ -51,40 +75,55 @@ This repository implements the **Nupf_EventExposure** service for `go-upf` per *
             "ulNbOfPackets": 800,
             "dlNbOfPackets": 1200
           },
-          "throughputStatisticsMeasurement": {
-            "ulAverageThroughput": "139810 bps",
-            "dlAverageThroughput": "279620 bps"
+          "throughputMeasurement": {
+            "ulThroughput": "139810 bps",
+            "dlThroughput": "279620 bps",
+            "ulPacketThroughput": "26.67 pps",
+            "dlPacketThroughput": "40.00 pps"
           }
         }
       ]
     }
   ],
-  "correlationId": "corr-12345"
+  "correlationId": "corr-session-001"
 }
 ```
+
+**Note**: The fields included depend on the `measurementTypes` in the subscription:
+- `VOLUME_MEASUREMENT` → includes `volumeMeasurement`
+- `THROUGHPUT_MEASUREMENT` → includes `throughputMeasurement`
 
 ---
 
 ## Architecture
 
+The EES uses a **Pure Push model** – SMF-provisioned URRs generate usage reports that are pushed from the kernel via Handler to the Aggregator. No Shadow URRs are created; we leverage existing SMF URR data.
+
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │                           go-upf                                 │
+│                                                                  │
 │  ┌──────────┐    ┌────────────┐    ┌──────────┐                 │
 │  │API Server│───▶│ Aggregator │───▶│ Notifier │──▶ HTTP POST    │
-│  └────┬─────┘    └─────▲──────┘    └──────────┘                 │
-│       │                │ PushReport                              │
-│       ▼                │                                         │
-│  ┌────────────┐   ┌────┴─────┐                                  │
-│  │Provisioner │   │ Handler  │◀── USA Reports                   │
-│  └────┬───────┘   └──────────┘                                  │
-│       │ CreateURR                                                │
-│       ▼                                                          │
+│  └──────────┘    └─────▲──────┘    └──────────┘                 │
+│                        │ PushReport                              │
+│                        │                                         │
+│                   ┌────┴─────┐                                  │
+│                   │ Handler  │◀── URR 2 (MAQE) Reports          │
+│                   └──────────┘                                  │
+│                        ▲                                         │
+│                        │ Periodic USA Reports                    │
 │  ┌──────────────────────────────────────────────────────────┐   │
 │  │                  gtp5g Kernel Module                      │   │
 │  └──────────────────────────────────────────────────────────┘   │
 └─────────────────────────────────────────────────────────────────┘
 ```
+
+**Data Flow**:
+1. SMF provisions URR 2 (N3N6_MAQE) for sessions via PFCP
+2. Kernel pushes periodic USA reports to Handler
+3. Handler calls `Aggregator.PushReport()` to buffer reports
+4. Aggregator consolidates and dispatches notifications per subscription period
 
 ---
 
@@ -107,9 +146,13 @@ EES:
 
 `POST /nupf-ee/v1/ee-subscriptions`
 
+**Response**: `201 Created` with `Location` header containing the subscription URI.
+
 ### Delete Subscription
 
 `DELETE /nupf-ee/v1/ee-subscriptions/{subscriptionId}`
+
+**Response**: `204 No Content`
 
 ---
 
@@ -136,7 +179,7 @@ curl -X POST http://127.0.0.1:8088/nupf-ee/v1/ee-subscriptions \
   }'
 ```
 
-### 2. PER_APPLICATION (Requires appIds and checking only)
+### 2. PER_APPLICATION (API validation only, requires DPI for data)
 
 ```bash
 curl -X POST http://127.0.0.1:8088/nupf-ee/v1/ee-subscriptions \
@@ -158,7 +201,7 @@ curl -X POST http://127.0.0.1:8088/nupf-ee/v1/ee-subscriptions \
   }'
 ```
 
-### 3. PER_FLOW (Requires trafficFilters and checking only)
+### 3. PER_FLOW (API validation only, requires DPI for data)
 
 ```bash
 curl -X POST http://127.0.0.1:8088/nupf-ee/v1/ee-subscriptions \
@@ -182,7 +225,7 @@ curl -X POST http://127.0.0.1:8088/nupf-ee/v1/ee-subscriptions \
   }'
 ```
 
-### 4. ONE_TIME (Immediate Report but no totoal volume)
+### 4. ONE_TIME (Immediate Report)
 
 ```bash
 curl -X POST http://127.0.0.1:8088/nupf-ee/v1/ee-subscriptions \
@@ -212,6 +255,7 @@ curl -X POST http://127.0.0.1:8088/nupf-ee/v1/ee-subscriptions \
 | `granularityOfMeasurement = PER_APPLICATION` | `appIds` is mandatory |
 | `granularityOfMeasurement = PER_FLOW` | `trafficFilters` is mandatory |
 | Targeting | Either `anyUe: true` OR `ueIpAddress` |
+| `reportPeriod` (PERIODIC mode) | Must be ≥ URR period and a multiple of it |
 
 ---
 
@@ -219,11 +263,12 @@ curl -X POST http://127.0.0.1:8088/nupf-ee/v1/ee-subscriptions \
 
 | File | Purpose |
 |------|---------|
-| `internal/ees/api.go` | REST API handlers |
-| `internal/ees/aggregator.go` | Report buffering and periodic dispatch |
-| `internal/ees/notifier.go` | TS 29.564 payload construction |
-| `internal/ees/provisioner.go` | Shadow URR creation |
-| `internal/ees/types.go` | Data structures |
+| `internal/ees/api.go` | REST API handlers and subscription validation |
+| `internal/ees/aggregator.go` | Report buffering, consolidation, and periodic dispatch |
+| `internal/ees/handler.go` | Receives kernel URR reports and forwards to Aggregator |
+| `internal/ees/notifier.go` | TS 29.564 payload construction and HTTP delivery |
+| `internal/ees/subscription_store.go` | Thread-safe in-memory subscription management |
+| `internal/ees/types.go` | Data structures and type definitions |
 
 ---
 

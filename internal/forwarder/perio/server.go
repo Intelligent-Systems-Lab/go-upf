@@ -94,6 +94,9 @@ type Server struct {
 
 	handler  report.Handler
 	queryURR func(map[uint64][]uint32) (map[uint64][]report.USAReport, error)
+
+	// Callback when a new URR is added (for EES period adjustment)
+	onURRAdded func(urrid uint32, period time.Duration)
 }
 
 func OpenServer(wg *sync.WaitGroup) (*Server, error) {
@@ -118,6 +121,12 @@ func (s *Server) Handle(
 ) {
 	s.handler = handler
 	s.queryURR = queryURR
+}
+
+// SetOnURRAdded sets the callback function that is invoked when a new URR is added.
+// This is used by EES to trigger automatic period adjustment.
+func (s *Server) SetOnURRAdded(callback func(urrid uint32, period time.Duration)) {
+	s.onURRAdded = callback
 }
 
 func (s *Server) Serve(wg *sync.WaitGroup) {
@@ -145,6 +154,11 @@ func (s *Server) Serve(wg *sync.WaitGroup) {
 					continue
 				}
 				s.perioList[e.period] = perioGroup
+			}
+
+			// Trigger callback for EES period adjustment
+			if s.onURRAdded != nil {
+				s.onURRAdded(e.urrid, e.period)
 			}
 
 			urrids := perioGroup.urrids[e.lSeid]
@@ -239,4 +253,19 @@ func (s *Server) DelPeriodReportTimer(lSeid uint64, urrid uint32) {
 		lSeid: lSeid,
 		urrid: urrid,
 	}
+}
+
+// GetAnyURRPeriod returns the period of any active URR with the specified ID
+// across all sessions. Useful for getting a representative period when the
+// exact session is unknown. Returns 0 if the URR is not found.
+func (s *Server) GetAnyURRPeriod(urrid uint32) time.Duration {
+	for period, perioGroup := range s.perioList {
+		for _, urrids := range perioGroup.urrids {
+			_, ok := urrids[urrid]
+			if ok {
+				return period // Found an instance of this URR
+			}
+		}
+	}
+	return 0
 }
