@@ -479,8 +479,6 @@ func (g *Gtp5g) CreatePDR(lSeid uint64, req *ie.IE) error {
 	// roleAddrIpv4 = net.IPv4(34, 35, 36, 37)
 	// pdr.RoleAddrIpv4 = &roleAddrIpv4
 
-	g.log.Infof("[DEBUG-CHECK] CreatePDR ID: %d, Attributes: %+v", pdrid, attrs)
-
 	// TODO:
 	// Not in 3GPP spec, just used for buffering
 	attrs = append(attrs, nl.Attr{
@@ -1150,7 +1148,7 @@ func (g *Gtp5g) CreateURR(lSeid uint64, req *ie.IE) error {
 			}
 		case ie.MeasurementMethod:
 			measureMethod, err = i.MeasurementMethod()
-			g.log.Infof("[DEBUG] CreateURR ID:%d Received Method:%d", urrid, measureMethod)
+
 			if err != nil {
 				return err
 			}
