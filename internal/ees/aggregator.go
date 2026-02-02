@@ -18,12 +18,18 @@ import (
 	"sync"
 	"time"
 
-	"github.com/free5gc/go-upf/internal/report"
 	"go.uber.org/zap"
+
+	"github.com/free5gc/go-upf/internal/report"
 )
 
 // Aggregator accumulates usage reports pushed from the kernel and periodically
 // sends notifications to subscribers. This is a pure Push model - no active polling.
+// PerioServerInterface provides access to URR period information
+type PerioServerInterface interface {
+	GetAnyURRPeriod(urrid uint32) time.Duration
+}
+
 type Aggregator struct {
 	subscriptionStore *SubscriptionStore
 	reportPeriod      time.Duration
@@ -35,7 +41,13 @@ type Aggregator struct {
 	// [Push Mode] Accumulated reports per subscription: Key=SubscriptionID
 	reportBuffer map[string][]UsageMeasures
 
-	sessionProvider SessionProvider // Added: to lookup UE IP
+	sessionProvider SessionProvider      // Added: to lookup UE IP
+	perioServer     PerioServerInterface // Added: to query URR periods
+
+	// Dynamic period adjustment
+	ticker         *time.Ticker
+	tickerMu       sync.Mutex
+	periodAdjusted bool // Marks if period has been adjusted once
 
 	// [Legacy] State cache: kept for delta computation if needed
 	// Key: SessionKey, Value: Last Counters
@@ -52,6 +64,7 @@ func NewAggregator(
 	notifier *Notifier,
 	logger *zap.Logger,
 	sessionProvider SessionProvider,
+	perioServer PerioServerInterface,
 ) *Aggregator {
 	return &Aggregator{
 		subscriptionStore: subscriptionStore,
@@ -59,6 +72,7 @@ func NewAggregator(
 		notifier:          notifier,
 		logger:            logger,
 		sessionProvider:   sessionProvider,
+		perioServer:       perioServer,
 
 		// Initialize report buffer for Push mode
 		reportBuffer: make(map[string][]UsageMeasures),
@@ -71,9 +85,10 @@ func NewAggregator(
 
 // Run starts the periodic loop until ctx is done.
 func (aggregator *Aggregator) Run(parentContext context.Context) {
-
-	ticker := time.NewTicker(aggregator.reportPeriod)
-	defer ticker.Stop()
+	// Initialize ticker
+	aggregator.tickerMu.Lock()
+	aggregator.ticker = time.NewTicker(aggregator.reportPeriod)
+	aggregator.tickerMu.Unlock()
 
 	aggregator.logger.Info("ees aggregator started",
 		zap.Duration("reportPeriod", aggregator.reportPeriod),
@@ -82,14 +97,26 @@ func (aggregator *Aggregator) Run(parentContext context.Context) {
 	for {
 		select {
 		case <-parentContext.Done():
+			aggregator.tickerMu.Lock()
+			if aggregator.ticker != nil {
+				aggregator.ticker.Stop()
+			}
+			aggregator.tickerMu.Unlock()
 			aggregator.logger.Info("ees aggregator stopped")
 			return
-		case <-ticker.C:
+		case <-aggregator.getTicker().C:
 			if _, err := aggregator.TickOnce(parentContext); err != nil {
 				aggregator.logger.Warn("ees aggregator tick failed", zap.Error(err))
 			}
 		}
 	}
+}
+
+// getTicker safely retrieves the current ticker
+func (aggregator *Aggregator) getTicker() *time.Ticker {
+	aggregator.tickerMu.Lock()
+	defer aggregator.tickerMu.Unlock()
+	return aggregator.ticker
 }
 
 // TickOnce sends notifications using accumulated reports from the Push buffer.
@@ -237,8 +264,8 @@ func consolidateReports(reports []UsageMeasures) []UsageMeasures {
 		existing, ok := consolidated[r.Key]
 		if !ok {
 			// First occurrence - create a copy
-			copy := r
-			consolidated[r.Key] = &copy
+			rCopy := r
+			consolidated[r.Key] = &rCopy
 			continue
 		}
 
@@ -409,55 +436,80 @@ func (aggregator *Aggregator) matchesSubscription(sub *Subscription, ueIpv4Addr 
 	return false
 }
 
-// computeUsageMeasuresFromCurrent uses the provider's current counters as-is (interval semantics)
-// and derives throughputs from StartTime/EndTime.
-func computeUsageMeasuresFromCurrent(currentSnapshot map[SessionKey]Counters) []UsageMeasures {
-	usageMeasuresList := make([]UsageMeasures, 0, len(currentSnapshot))
-	for sessionKey, currentCounters := range currentSnapshot {
-		usage := UsageMeasures{
-			Key:            sessionKey,
-			ULBytesDelta:   currentCounters.ULBytes,
-			DLBytesDelta:   currentCounters.DLBytes,
-			ULPacketsDelta: currentCounters.ULPackets,
-			DLPacketsDelta: currentCounters.DLPackets,
-			StartTime:      currentCounters.StartTime,
-			EndTime:        currentCounters.EndTime,
-		}
-		computeThroughputIfPossible(&usage)
-		usageMeasuresList = append(usageMeasuresList, usage)
-	}
-	return usageMeasuresList
-}
-
-// computeThroughputIfPossible computes UL/DL bps from bytes and (EndTime - StartTime).
+// computeThroughputIfPossible computes UL/DL bps and pps from bytes/packets and (EndTime - StartTime).
 // Guards against non-positive duration by skipping throughput calculation.
 func computeThroughputIfPossible(usage *UsageMeasures) {
 	durationSeconds := usage.EndTime.Sub(usage.StartTime).Seconds()
 	if durationSeconds <= 0 {
 		return
 	}
+	// Bit rate: bytes * 8 / seconds
 	usage.ULThroughputBps = (float64(usage.ULBytesDelta) * 8.0) / durationSeconds
 	usage.DLThroughputBps = (float64(usage.DLBytesDelta) * 8.0) / durationSeconds
+
+	// Packet rate: packets / seconds
+	usage.ULPacketThroughputPps = float64(usage.ULPacketsDelta) / durationSeconds
+	usage.DLPacketThroughputPps = float64(usage.DLPacketsDelta) / durationSeconds
 }
 
-// refreshSnapshots copies the current snapshot into the subscription.Snapshots map.
-// While interval semantics do not need previous snapshots for delta, we keep this
-// for cleanup symmetry and potential future cumulative modes.
-func refreshSnapshots(subscription *Subscription, currentSnapshot map[SessionKey]Counters) {
-	if subscription.Snapshots == nil {
-		subscription.Snapshots = make(map[SessionKey]Counters, len(currentSnapshot))
-	}
-	for sessionKey, currentCounters := range currentSnapshot {
-		subscription.Snapshots[sessionKey] = currentCounters
-	}
-}
+// AdjustReportPeriod dynamically adjusts the aggregator's report period.
+// This should be called once when the first session is established.
+// Returns true if adjustment was performed, false if already adjusted or invalid.
+func (aggregator *Aggregator) AdjustReportPeriod(urrPeriod time.Duration) bool {
+	aggregator.tickerMu.Lock()
+	defer aggregator.tickerMu.Unlock()
 
-// cleanupUnusedSessionKeys removes keys from subscription.Snapshots that are not present
-// in the current snapshot key set (simple "clean unused source" strategy).
-func cleanupUnusedSessionKeys(subscription *Subscription, currentKeysSet map[SessionKey]struct{}) {
-	for sessionKey := range subscription.Snapshots {
-		if _, stillPresent := currentKeysSet[sessionKey]; !stillPresent {
-			delete(subscription.Snapshots, sessionKey)
-		}
+	// Only adjust once
+	if aggregator.periodAdjusted {
+		aggregator.logger.Debug("ees period already adjusted, skipping")
+		return false
 	}
+
+	if urrPeriod <= 0 {
+		aggregator.logger.Warn("ees invalid URR period for adjustment",
+			zap.Duration("urrPeriod", urrPeriod))
+		return false
+	}
+
+	urrPeriodSec := int(urrPeriod.Seconds())
+	currentPeriodSec := int(aggregator.reportPeriod.Seconds())
+
+	// Calculate the optimal aggregator period (smallest multiple of URR period)
+	var newPeriodSec int
+	if currentPeriodSec < urrPeriodSec {
+		// Current period too short, use URR period
+		newPeriodSec = urrPeriodSec
+	} else if currentPeriodSec%urrPeriodSec != 0 {
+		// Not a multiple, round up to nearest multiple
+		multiplier := (currentPeriodSec / urrPeriodSec) + 1
+		newPeriodSec = multiplier * urrPeriodSec
+	} else {
+		// Already a valid multiple, no adjustment needed
+		aggregator.periodAdjusted = true
+		aggregator.logger.Info("ees period already optimal",
+			zap.Int("currentPeriod", currentPeriodSec),
+			zap.Int("urrPeriod", urrPeriodSec),
+		)
+		return false
+	}
+
+	newPeriod := time.Duration(newPeriodSec) * time.Second
+
+	// Stop old ticker
+	if aggregator.ticker != nil {
+		aggregator.ticker.Stop()
+	}
+
+	// Update period and create new ticker
+	aggregator.reportPeriod = newPeriod
+	aggregator.ticker = time.NewTicker(newPeriod)
+	aggregator.periodAdjusted = true
+
+	aggregator.logger.Info("ees aggregator period adjusted",
+		zap.Int("oldPeriod", currentPeriodSec),
+		zap.Int("newPeriod", newPeriodSec),
+		zap.Int("urrPeriod", urrPeriodSec),
+	)
+
+	return true
 }

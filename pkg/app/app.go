@@ -7,18 +7,17 @@ import (
 	"runtime/debug"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/sirupsen/logrus"
+	"go.uber.org/zap"
 
+	"github.com/free5gc/go-upf/internal/ees"
 	"github.com/free5gc/go-upf/internal/forwarder"
+	"github.com/free5gc/go-upf/internal/forwarder/perio"
 	"github.com/free5gc/go-upf/internal/logger"
 	"github.com/free5gc/go-upf/internal/pfcp"
 	"github.com/free5gc/go-upf/pkg/factory"
-
-	"time" // [new]
-
-	"github.com/free5gc/go-upf/internal/ees" // [new]
-	"go.uber.org/zap"                        // [new]
 )
 
 type UpfApp struct {
@@ -190,17 +189,38 @@ func (u *UpfApp) Run() error {
 		localNode := u.pfcpServer.GetLocalNode()
 		sessionProvider := localNode
 
+		// Get perioServer from driver for URR period queries
+		var perioServer *perio.Server
+		if gtp5gDriver, ok := u.driver.(*forwarder.Gtp5g); ok {
+			perioServer = gtp5gDriver.GetPerioServer()
+		}
+
 		aggregator := ees.NewAggregator(
 			subscriptionStore,
 			time.Duration(period)*time.Second,
 			notifier,
 			eesLogger,
 			sessionProvider,
+			perioServer, // Pass perioServer for period validation
 		)
 
 		// 3. Register EES Handler to Dispatcher
 		eesHandler := ees.NewHandler(aggregator, eesLogger)
-		reportDispatcher.RegisterEESHandler(eesHandler)
+		reportDispatcher.RegisterEESHandler(eesHandler, aggregator) // Pass aggregator for callbacks
+
+		// Set perioServer for dispatcher callbacks
+		if perioServer != nil {
+			reportDispatcher.SetPerioServer(perioServer)
+
+			// Register callback to adjust aggregator period when URR is added
+			perioServer.SetOnURRAdded(func(urrid uint32, period time.Duration) {
+				// Only adjust for URR 2 (the periodic measurement URR)
+				if urrid == 2 {
+					logger.MainLog.Infof("EES: URR %d added with period %v, triggering aggregator adjustment", urrid, period)
+					aggregator.AdjustReportPeriod(period)
+				}
+			})
+		}
 
 		// 4. Start Aggregator (processes buffered reports periodically)
 		go aggregator.Run(u.ctx)

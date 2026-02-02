@@ -185,6 +185,12 @@ func (g *Gtp5g) GetUsageStatistic() (*gtp5gnl.UsageStatistic, error) {
 	return ustat, nil
 }
 
+// GetPerioServer returns the periodic report server for querying URR periods.
+// This is used by EES to validate subscription periods against URR measurement periods.
+func (g *Gtp5g) GetPerioServer() *perio.Server {
+	return g.ps
+}
+
 func (g *Gtp5g) newFlowDesc(s string, swapSrcDst bool) (nl.AttrList, error) {
 	var attrs nl.AttrList
 	fd, err := ParseFlowDesc(s)

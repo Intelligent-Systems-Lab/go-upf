@@ -144,6 +144,10 @@ type UsageMeasures struct {
 	ULThroughputBps float64
 	DLThroughputBps float64
 
+	// Derived packet throughput (packets per second)
+	ULPacketThroughputPps float64
+	DLPacketThroughputPps float64
+
 	// TS 29.564 UE identifiers
 	UeIpv4Addr string // UE IPv4 Address from session context
 }

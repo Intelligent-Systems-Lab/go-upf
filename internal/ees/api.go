@@ -84,11 +84,15 @@ type UpfEventSubscription struct {
 }
 
 type UpfEvent struct {
-	Type                     string            `json:"type"`
-	MeasurementTypes         []string          `json:"measurementTypes,omitempty"`         // TS 29.564: Required when type=USER_DATA_USAGE_MEASURES
-	GranularityOfMeasurement string            `json:"granularityOfMeasurement,omitempty"` // PER_SESSION, PER_APPLICATION, PER_FLOW
-	AppIds                   []string          `json:"appIds,omitempty"`                   // Required for PER_APPLICATION
-	TrafficFilters           []FlowInformation `json:"trafficFilters,omitempty"`           // Required for PER_FLOW
+	Type             string   `json:"type"`
+	MeasurementTypes []string `json:"measurementTypes,omitempty"`
+	// TS 29.564: Required when type=USER_DATA_USAGE_MEASURES
+	GranularityOfMeasurement string `json:"granularityOfMeasurement,omitempty"`
+	// PER_SESSION, PER_APPLICATION, PER_FLOW
+	AppIds []string `json:"appIds,omitempty"`
+	// Required for PER_APPLICATION
+	TrafficFilters []FlowInformation `json:"trafficFilters,omitempty"`
+	// Required for PER_FLOW
 }
 
 type UpfEventMode struct {
@@ -239,7 +243,7 @@ func (server *Server) validateAndBuildSubscription(req createSubscriptionRequest
 	// MVP: Only support exactly one event which matches USER_DATA_USAGE_MEASURES
 	foundSupportedEvent := false
 	var measurementTypes []MeasurementType
-	var granularity Granularity = GranularityPerSession // Default
+	granularity := GranularityPerSession // Default
 	var appIds []string
 	var trafficFilters []FlowInformation
 
@@ -278,14 +282,16 @@ func (server *Server) validateAndBuildSubscription(req createSubscriptionRequest
 					granularity = GranularityPerApplication
 					// Validate: PER_APPLICATION requires appIds
 					if len(evt.AppIds) == 0 {
-						return nil, fmt.Errorf("missing mandatory attribute: appIds is required when granularityOfMeasurement is PER_APPLICATION")
+						return nil, fmt.Errorf(
+							"missing mandatory attribute: appIds required for PER_APPLICATION")
 					}
 					appIds = evt.AppIds
 				case string(GranularityPerFlow):
 					granularity = GranularityPerFlow
 					// Validate: PER_FLOW requires trafficFilters
 					if len(evt.TrafficFilters) == 0 {
-						return nil, fmt.Errorf("missing mandatory attribute: trafficFilters is required when granularityOfMeasurement is PER_FLOW")
+						return nil, fmt.Errorf(
+							"missing mandatory attribute: trafficFilters required for PER_FLOW")
 					}
 					trafficFilters = evt.TrafficFilters
 				default:
@@ -326,6 +332,41 @@ func (server *Server) validateAndBuildSubscription(req createSubscriptionRequest
 			if periodSec <= 0 {
 				periodSec = 10
 			}
+		}
+	}
+
+	// Validate period against URR measurement period (if available)
+	if chosenMode == ModePeriodic && server.aggregator.perioServer != nil {
+		// Try to get URR 2 period from perio.Server
+		urrPeriod := server.aggregator.perioServer.GetAnyURRPeriod(2)
+		if urrPeriod > 0 {
+			urrPeriodSec := int(urrPeriod.Seconds())
+
+			// Validation 1: Subscription period must not be shorter than URR period
+			if periodSec < urrPeriodSec {
+				return nil, fmt.Errorf(
+					"invalid reporting period: requested %ds is shorter than URR measurement period %ds",
+					periodSec, urrPeriodSec,
+				)
+			}
+
+			// Validation 2: Subscription period must be a multiple of URR period
+			if periodSec%urrPeriodSec != 0 {
+				return nil, fmt.Errorf(
+					"invalid reporting period: requested %ds is not a multiple of URR measurement period %ds",
+					periodSec, urrPeriodSec,
+				)
+			}
+
+			server.logger.Debug("ees subscription period validated",
+				zap.Int("requestedPeriod", periodSec),
+				zap.Int("urrPeriod", urrPeriodSec),
+			)
+		} else {
+			// URR 2 not yet established, log warning but allow subscription
+			server.logger.Warn("ees cannot validate period: URR 2 not found in perio server",
+				zap.Int("requestedPeriod", periodSec),
+			)
 		}
 	}
 

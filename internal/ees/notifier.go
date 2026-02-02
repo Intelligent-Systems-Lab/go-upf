@@ -122,8 +122,10 @@ func (notifier *Notifier) Notify(subscription *Subscription, measures []UsageMea
 			// Conditionally add Throughput Measurement
 			if subscription.HasMeasurementType(MeasureThroughput) {
 				measurement.ThroughputMeasurement = &ThroughputMeasurement{
-					UlThroughput: fmt.Sprintf("%.0f bps", m.ULThroughputBps),
-					DlThroughput: fmt.Sprintf("%.0f bps", m.DLThroughputBps),
+					UlThroughput:       fmt.Sprintf("%.0f bps", m.ULThroughputBps),
+					DlThroughput:       fmt.Sprintf("%.0f bps", m.DLThroughputBps),
+					UlPacketThroughput: fmt.Sprintf("%.2f pps", m.ULPacketThroughputPps),
+					DlPacketThroughput: fmt.Sprintf("%.2f pps", m.DLPacketThroughputPps),
 				}
 			}
 
