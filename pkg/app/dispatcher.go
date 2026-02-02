@@ -1,7 +1,6 @@
 package app
 
 import (
-	"fmt"
 	"time"
 
 	"github.com/free5gc/go-upf/internal/report"
@@ -47,7 +46,6 @@ func (d *Dispatcher) RegisterEESHandler(handler report.Handler, aggregator inter
 func (d *Dispatcher) NotifySessReport(sessRpt report.SessReport) {
 	// Debug: Log incoming report
 	// Using fmt since we don't have a logger here
-	fmt.Printf("[Dispatcher] NotifySessReport: SEID=%#x, ReportCount=%d\n", sessRpt.SEID, len(sessRpt.Reports))
 
 	// Dispatch to PFCP (N4) - all reports
 	if d.pfcpHandler != nil {
@@ -56,11 +54,9 @@ func (d *Dispatcher) NotifySessReport(sessRpt report.SessReport) {
 
 	// Dispatch to EES - all reports (EES aggregator filters by URRID >= 7)
 	if d.eesHandler != nil {
-		fmt.Printf("[Dispatcher] Forwarding to EES handler\n")
 		d.eesHandler.NotifySessReport(sessRpt)
-	} else {
-		fmt.Printf("[Dispatcher] WARNING: eesHandler is nil!\n")
 	}
+
 }
 
 // PopBufPkt delegates buffering logic exclusively to the PFCP handler.
@@ -91,8 +87,7 @@ func (d *Dispatcher) OnSessionEstablished() {
 	if urrPeriod > 0 {
 		// Attempt to adjust aggregator period
 		adjusted := d.eesAggregator.AdjustReportPeriod(urrPeriod)
-		if adjusted {
-			fmt.Printf("[Dispatcher] EES aggregator period adjusted based on URR 2 period: %v\n", urrPeriod)
-		}
+		_ = adjusted
+
 	}
 }

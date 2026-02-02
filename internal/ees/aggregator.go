@@ -47,7 +47,8 @@ type Aggregator struct {
 	// Dynamic period adjustment
 	ticker         *time.Ticker
 	tickerMu       sync.Mutex
-	periodAdjusted bool // Marks if period has been adjusted once
+	tickerReset    chan struct{} // Signal to reset ticker when period changes
+	periodAdjusted bool          // Marks if period has been adjusted once
 
 	// [Legacy] State cache: kept for delta computation if needed
 	// Key: SessionKey, Value: Last Counters
@@ -77,6 +78,9 @@ func NewAggregator(
 		// Initialize report buffer for Push mode
 		reportBuffer: make(map[string][]UsageMeasures),
 
+		// Initialize ticker reset channel
+		tickerReset: make(chan struct{}, 1),
+
 		// Initialize legacy snapshot maps (kept for potential future use)
 		lastSnapshot:     make(map[SessionKey]Counters),
 		lastSnapshotTime: time.Now(),
@@ -84,29 +88,48 @@ func NewAggregator(
 }
 
 // Run starts the periodic loop until ctx is done.
+// Uses a dual-loop structure to handle ticker replacement when period is adjusted.
 func (aggregator *Aggregator) Run(parentContext context.Context) {
-	// Initialize ticker
-	aggregator.tickerMu.Lock()
-	aggregator.ticker = time.NewTicker(aggregator.reportPeriod)
-	aggregator.tickerMu.Unlock()
-
 	aggregator.logger.Info("ees aggregator started",
 		zap.Duration("reportPeriod", aggregator.reportPeriod),
 	)
 
+	// Outer loop: recreate ticker when reset signal is received
 	for {
-		select {
-		case <-parentContext.Done():
-			aggregator.tickerMu.Lock()
-			if aggregator.ticker != nil {
-				aggregator.ticker.Stop()
-			}
-			aggregator.tickerMu.Unlock()
-			aggregator.logger.Info("ees aggregator stopped")
-			return
-		case <-aggregator.getTicker().C:
-			if _, err := aggregator.TickOnce(parentContext); err != nil {
-				aggregator.logger.Warn("ees aggregator tick failed", zap.Error(err))
+		// Create/recreate ticker with current period
+		aggregator.tickerMu.Lock()
+		if aggregator.ticker != nil {
+			aggregator.ticker.Stop()
+		}
+		aggregator.ticker = time.NewTicker(aggregator.reportPeriod)
+		tickerC := aggregator.ticker.C // Capture channel before unlocking
+		currentPeriod := aggregator.reportPeriod
+		aggregator.tickerMu.Unlock()
+
+		aggregator.logger.Debug("ees ticker initialized",
+			zap.Duration("period", currentPeriod),
+		)
+
+		// Inner loop: process ticks until reset or shutdown
+	tickerLoop:
+		for {
+			select {
+			case <-parentContext.Done():
+				aggregator.tickerMu.Lock()
+				if aggregator.ticker != nil {
+					aggregator.ticker.Stop()
+				}
+				aggregator.tickerMu.Unlock()
+				aggregator.logger.Info("ees aggregator stopped")
+				return
+			case <-aggregator.tickerReset:
+				// Ticker needs to be recreated with new period
+				aggregator.logger.Info("ees ticker reset signal received, recreating ticker")
+				break tickerLoop
+			case <-tickerC:
+				if _, err := aggregator.TickOnce(parentContext); err != nil {
+					aggregator.logger.Warn("ees aggregator tick failed", zap.Error(err))
+				}
 			}
 		}
 	}
@@ -140,6 +163,11 @@ func (aggregator *Aggregator) TickOnce(ctx context.Context) (int, error) {
 	newBuffer := make(map[string][]UsageMeasures)
 	aggregator.mu.Unlock()
 
+	aggregator.logger.Info("ees tick - processing buffer",
+		zap.Int("subscriptionCount", len(bufferedReports)),
+		zap.Time("currentTime", now),
+	)
+
 	// Iterate over all subscriptions
 	subscriptions := aggregator.subscriptionStore.AllSubscriptions()
 
@@ -159,8 +187,18 @@ func (aggregator *Aggregator) TickOnce(ctx context.Context) (int, error) {
 		usageMeasuresList, hasReports := bufferedReports[subscription.ID]
 
 		if !hasReports || len(usageMeasuresList) == 0 {
+			aggregator.logger.Debug("ees tick - no reports for subscription",
+				zap.String("subscriptionId", subscription.ID),
+			)
 			continue
 		}
+
+		aggregator.logger.Info("ees tick - subscription has reports",
+			zap.String("subscriptionId", subscription.ID),
+			zap.Int("reportCount", len(usageMeasuresList)),
+			zap.String("mode", string(subscription.Mode)),
+			zap.Int("periodSec", subscription.PeriodSec),
+		)
 
 		// Check if enough time has passed since last notification (respect subscription's reportPeriod)
 		// For ON_DEMAND mode, always send immediately
@@ -178,14 +216,22 @@ func (aggregator *Aggregator) TickOnce(ctx context.Context) (int, error) {
 				newBuffer[subscription.ID] = append(newBuffer[subscription.ID], usageMeasuresList...)
 				aggregator.mu.Unlock()
 
-				aggregator.logger.Debug("ees skipping notification - period not elapsed",
+				remainingTime := periodDuration - timeSinceLastNotify
+				aggregator.logger.Info("ees buffering reports - period not elapsed",
 					zap.String("subscriptionId", subscription.ID),
 					zap.Duration("elapsed", timeSinceLastNotify),
-					zap.Duration("period", periodDuration),
+					zap.Duration("periodRequired", periodDuration),
+					zap.Duration("remaining", remainingTime),
 					zap.Int("bufferedReports", len(usageMeasuresList)),
 				)
 				continue
 			}
+
+			aggregator.logger.Info("ees ready to send notification - period elapsed",
+				zap.String("subscriptionId", subscription.ID),
+				zap.Duration("timeSinceLastNotify", timeSinceLastNotify),
+				zap.Duration("periodRequired", periodDuration),
+			)
 		}
 
 		// Consolidate reports: merge multiple reports for the same session
@@ -218,6 +264,12 @@ func (aggregator *Aggregator) TickOnce(ctx context.Context) (int, error) {
 		}
 
 		// PERIODIC mode - send notification
+		aggregator.logger.Info("ees sending notification",
+			zap.String("subscriptionId", subscription.ID),
+			zap.String("notifyUri", subscription.NotifURI),
+			zap.Int("items", len(consolidatedList)),
+		)
+
 		if err := aggregator.notifier.Notify(subscription, consolidatedList); err != nil {
 			aggregator.logger.Warn("ees notify (periodic) failed",
 				zap.String("subscriptionId", subscription.ID),
@@ -231,6 +283,7 @@ func (aggregator *Aggregator) TickOnce(ctx context.Context) (int, error) {
 				zap.String("subscriptionId", subscription.ID),
 				zap.Int("items", len(consolidatedList)),
 				zap.Int("periodSec", subscription.PeriodSec),
+				zap.Time("nextNotifyAfter", now.Add(time.Duration(subscription.PeriodSec)*time.Second)),
 			)
 		}
 	}
@@ -495,14 +548,8 @@ func (aggregator *Aggregator) AdjustReportPeriod(urrPeriod time.Duration) bool {
 
 	newPeriod := time.Duration(newPeriodSec) * time.Second
 
-	// Stop old ticker
-	if aggregator.ticker != nil {
-		aggregator.ticker.Stop()
-	}
-
-	// Update period and create new ticker
+	// Update period (ticker will be recreated by Run loop)
 	aggregator.reportPeriod = newPeriod
-	aggregator.ticker = time.NewTicker(newPeriod)
 	aggregator.periodAdjusted = true
 
 	aggregator.logger.Info("ees aggregator period adjusted",
@@ -510,6 +557,14 @@ func (aggregator *Aggregator) AdjustReportPeriod(urrPeriod time.Duration) bool {
 		zap.Int("newPeriod", newPeriodSec),
 		zap.Int("urrPeriod", urrPeriodSec),
 	)
+
+	// Signal ticker reset (non-blocking)
+	select {
+	case aggregator.tickerReset <- struct{}{}:
+		aggregator.logger.Debug("ees ticker reset signal sent")
+	default:
+		aggregator.logger.Debug("ees ticker reset signal already pending")
+	}
 
 	return true
 }
