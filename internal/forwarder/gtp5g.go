@@ -173,18 +173,6 @@ func (g *Gtp5g) Link() *Gtp5gLink {
 	return g.link
 }
 
-// GetUsageStatistic queries the gtp5g kernel module for device-level traffic statistics.
-// Returns cumulative UL/DL bytes and packets since device creation.
-// Note: These statistics are never cleared and represent total traffic through the gtp5g device.
-func (g *Gtp5g) GetUsageStatistic() (*gtp5gnl.UsageStatistic, error) {
-	ustat, err := gtp5gnl.GetUsageStatistic(g.client, g.link.link)
-	if err != nil {
-		g.log.Warnf("Failed to get usage statistic: %v", err)
-		return nil, err
-	}
-	return ustat, nil
-}
-
 // GetPerioServer returns the periodic report server for querying URR periods.
 // This is used by EES to validate subscription periods against URR measurement periods.
 func (g *Gtp5g) GetPerioServer() *perio.Server {
