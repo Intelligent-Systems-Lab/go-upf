@@ -125,6 +125,78 @@ The EES uses a **Pure Push model** – SMF-provisioned URRs generate usage repor
 3. Handler calls `Aggregator.PushReport()` to buffer reports
 4. Aggregator consolidates and dispatches notifications per subscription period
 
+### Subscription to Notification Flow
+
+```mermaid
+sequenceDiagram
+    participant NF as NF (SMF/NWDAF/PCF)
+    participant API as API Server
+    participant Store as Subscription Store
+    participant Kernel as gtp5g Kernel Module
+    participant Handler as EES Handler
+    participant Aggregator as Aggregator
+    participant Notifier as Notifier
+
+    %% 顏色定義 (使用淺色系)
+    rect rgb(240, 248, 255)
+    Note over NF,Kernel: Pre Phase : SMF 透過 PFCP 設置 URR
+    NF->>Kernel: PFCP Session Establishment<br/>設置 URR 2 (N3N6_MAQE, MAQE)
+    Note over Kernel: Kernel 開始收集流量統計<br/>(UL/DL bytes, packets)
+    end
+
+    rect rgb(255, 250, 230)
+    %% Phase 1: 訂閱創建
+    Note over NF,API: Phase 1: 訂閱創建
+    NF->>+API: POST /nupf-ee/v1/ee-subscriptions<br/>(eventType, measurementTypes, notifyUri, reportPeriod)
+    API->>API: validateAndBuildSubscription()<br/>驗證參數、granularity、targeting
+    API->>Store: AddSubscription()
+    Store-->>API: subscriptionId
+    API->>Aggregator: AdjustReportPeriod(urrPeriod)
+    Note over Aggregator: 當第一個訂閱建立時<br/>調整報告週期為 URR 週期
+    API-->>-NF: 201 Created<br/>Location: /ee-subscriptions/{id}<br/>返回 subscriptionId
+    end
+
+    rect rgb(245, 255, 245)
+    %% Phase 2: 週期性報告推送
+    Note over Kernel,Notifier: Phase 2: 週期性數據報告 (Pure Push Model)
+    loop 每個 URR 週期 (例如 10 秒)
+        Kernel->>Handler: Push SessReport<br/>(SEID, URR Reports with usage data)
+        Handler->>Handler: NotifySessReport()
+        Handler->>Aggregator: PushReport(sessRpt)
+        Note over Aggregator: 將報告存入 reportBuffer<br/>按 SessionKey 分組
+        Aggregator->>Aggregator: matchesSubscription()<br/>檢查是否匹配訂閱的 UE
+        Aggregator->>Aggregator: computeThroughputIfPossible()
+    end
+    end
+
+    rect rgb(255, 240, 245)
+    %% Phase 3: 聚合與通知
+    Note over Aggregator,Notifier: Phase 3: 聚合與通知發送
+    loop 每個訂閱的 reportPeriod (例如 30 秒)
+        Aggregator->>Aggregator: TickOnce()
+        Note over Aggregator: 檢查訂閱是否到達通知時間
+        Aggregator->>Aggregator: consolidateReports()<br/>合併同一 session 的多個報告
+        Note over Aggregator: 將多個 URR 週期的數據求和
+        Aggregator->>Notifier: Notify(subscription, measures)
+        Notifier->>Notifier: 構建 NotificationData
+        Notifier->>NF: HTTP POST to notifyUri
+        NF-->>Notifier: 200 OK
+        Notifier-->>Aggregator: Success
+        Note over Aggregator: 更新 lastNotificationTime
+        Aggregator->>Aggregator: 清空該訂閱的 reportBuffer
+    end
+    end
+
+    rect rgb(245, 245, 245)
+    %% Case : 訂閱刪除
+    Note over NF,Store: Case : 訂閱刪除
+    NF->>API: DELETE /nupf-ee/v1/ee-subscriptions/{id}
+    API->>Store: RemoveSubscription(id)
+    Store-->>API: Success
+    API-->>NF: 204 No Content
+    end
+```
+
 ---
 
 ## Configuration

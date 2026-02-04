@@ -176,7 +176,7 @@ func (u *UpfApp) Run() error {
 			eesLogger = zap.NewNop() // Fallback to no-op logger
 		}
 
-		// 2. Create Store / Notifier / Aggregator (no ActivePFCPSource needed for Push mode)
+		// 2. Create Store / Notifier / Aggregator
 		subscriptionStore := ees.NewSubscriptionStore("")
 		notifier := ees.NewNotifier(eesLogger)
 
@@ -185,7 +185,7 @@ func (u *UpfApp) Run() error {
 			period = u.cfg.EES.PeriodSec
 		}
 
-		// Pure Push mode: no sourceProvider needed, reports come from kernel
+		// Pure Push mode: Reports come from kernel
 		localNode := u.pfcpServer.GetLocalNode()
 		sessionProvider := localNode
 
