@@ -344,6 +344,16 @@ curl -X POST http://127.0.0.1:8088/nupf-ee/v1/ee-subscriptions \
 
 ---
 
+## Future Work
+* Add support for `USER_DATA_USAGE_TRENDS`
+* Add support for `QOS_MONITORING`
+* Add support for `TSC_MNGT_INFO`
+* Add support for `PER_APPLICATION` and `PER_FLOW` using standalone mechanism
+* Add support for `ONE_TIME`
+* Add support for `supi` / `gpsi` (If smf supports)
+
+---
+
 ## Standards References
 
 - **3GPP TS 29.564** — Nupf_EventExposure API
