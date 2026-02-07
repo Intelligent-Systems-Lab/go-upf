@@ -118,6 +118,17 @@ The EES uses a **Pure Push model** – SMF-provisioned URRs generate usage repor
 │  └──────────────────────────────────────────────────────────┘   │
 └─────────────────────────────────────────────────────────────────┘
 ```
+#### Changing file in smf `smf/internal/contet/pfcp_rules.go` is required
+```c
+func NewVolumeThreshold(threshold uint64) UrrOpt {
+        return func(urr *URR) {
+                if threshold > 0 { //new logic
+                        urr.ReportingTrigger.Volth = true
+                        urr.VolumeThreshold = threshold
+                }
+        }
+}
+```
 
 **Data Flow**:
 1. SMF provisions URR 2 (N3N6_MAQE) for sessions via PFCP
