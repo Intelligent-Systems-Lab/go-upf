@@ -59,32 +59,30 @@ func NewNotifier(logger *zap.Logger) *Notifier {
 	}
 }
 
-// notifyPayload is the JSON structure sent to subscriber endpoints.
-// Keep field names explicit for readability.
-type notifyPayload struct {
-	SubscriptionID string       `json:"subscriptionId"`
-	EventID        string       `json:"eventId"`
-	Granularity    string       `json:"granularity"`
-	Timestamp      time.Time    `json:"timestamp"`
-	Items          []notifyItem `json:"items"`
+// NotificationData per TS 29.564 schema.
+type NotificationData struct {
+	NotificationItems []NotificationItem `json:"notificationItems"`
+	CorrelationId     string             `json:"correlationId,omitempty"`
 }
 
-// notifyItem represents a single per-session measurement record.
-type notifyItem struct {
-	LocalSEID       uint64    `json:"localSeid"`
-	RemoteSEID      uint64    `json:"remoteSeid"`
-	ULBytes         uint64    `json:"ulBytes"`
-	DLBytes         uint64    `json:"dlBytes"`
-	ULPackets       uint64    `json:"ulPackets"`
-	DLPackets       uint64    `json:"dlPackets"`
-	StartTime       time.Time `json:"startTime"`
-	EndTime         time.Time `json:"endTime"`
-	ULThroughputBps float64   `json:"ulThroughputBps,omitempty"`
-	DLThroughputBps float64   `json:"dlThroughputBps,omitempty"`
+// NotificationItem per TS 29.564 schema.
+type NotificationItem struct {
+	// Required fields
+	EventType string    `json:"eventType"`
+	TimeStamp time.Time `json:"timeStamp"`
+
+	// Conditional: one of ueIpv4Addr, ueIpv6Prefix, or ueMacAddr must be present
+	UeIpv4Addr string `json:"ueIpv4Addr,omitempty"`
+
+	// Optional fields
+	Supi      string     `json:"supi,omitempty"`
+	StartTime *time.Time `json:"startTime,omitempty"`
+
+	// Measurements array per TS 29.564
+	UserDataUsageMeasurements []UserDataUsageMeasurements `json:"userDataUsageMeasurements,omitempty"`
 }
 
-// Notify converts a set of UsageMeasures into a single POST toward sub.NotifURI.
-// The function assumes sub.Event == USER_DATA_USAGE_MEASURES and sub.Granularity == perPduSession in MVP.
+// Notify converts a set of UsageMeasures into a POST request per TS 29.564.
 func (notifier *Notifier) Notify(subscription *Subscription, measures []UsageMeasures) error {
 	if subscription == nil {
 		return fmt.Errorf("notify: subscription is nil")
@@ -93,28 +91,62 @@ func (notifier *Notifier) Notify(subscription *Subscription, measures []UsageMea
 		return fmt.Errorf("notify: empty NotifURI for subscriptionId=%s", subscription.ID)
 	}
 
-	items := make([]notifyItem, 0, len(measures))
+	notificationItems := make([]NotificationItem, 0, len(measures))
+	now := time.Now()
+
 	for _, m := range measures {
-		items = append(items, notifyItem{
-			LocalSEID:       m.Key.LocalSEID,
-			RemoteSEID:      m.Key.RemoteSEID,
-			ULBytes:         m.ULBytesDelta,
-			DLBytes:         m.DLBytesDelta,
-			ULPackets:       m.ULPacketsDelta,
-			DLPackets:       m.DLPacketsDelta,
-			StartTime:       m.StartTime,
-			EndTime:         m.EndTime,
-			ULThroughputBps: m.ULThroughputBps,
-			DLThroughputBps: m.DLThroughputBps,
-		})
+		item := NotificationItem{
+			EventType:  string(subscription.Event),
+			TimeStamp:  now,
+			UeIpv4Addr: m.UeIpv4Addr,
+			StartTime:  &m.StartTime,
+		}
+
+		switch subscription.Event {
+		case EventUserDataUsageMeasures:
+			// Build UserDataUsageMeasurements per TS 29.564
+			measurement := UserDataUsageMeasurements{}
+
+			// Conditionally add Volume Measurement
+			if subscription.HasMeasurementType(MeasureVolume) {
+				measurement.VolumeMeasurement = &VolumeMeasurement{
+					TotalVolume:      m.ULBytesDelta + m.DLBytesDelta,
+					UlVolume:         m.ULBytesDelta,
+					DlVolume:         m.DLBytesDelta,
+					TotalNbOfPackets: m.ULPacketsDelta + m.DLPacketsDelta,
+					UlNbOfPackets:    m.ULPacketsDelta,
+					DlNbOfPackets:    m.DLPacketsDelta,
+				}
+			}
+
+			// Conditionally add Throughput Measurement
+			if subscription.HasMeasurementType(MeasureThroughput) {
+				measurement.ThroughputMeasurement = &ThroughputMeasurement{
+					UlThroughput:       fmt.Sprintf("%.0f bps", m.ULThroughputBps),
+					DlThroughput:       fmt.Sprintf("%.0f bps", m.DLThroughputBps),
+					UlPacketThroughput: fmt.Sprintf("%.2f pps", m.ULPacketThroughputPps),
+					DlPacketThroughput: fmt.Sprintf("%.2f pps", m.DLPacketThroughputPps),
+				}
+			}
+
+			item.UserDataUsageMeasurements = []UserDataUsageMeasurements{measurement}
+		case EventUserDataUsageTrends:
+			// Trends event: only throughput statistics
+			measurement := UserDataUsageMeasurements{
+				ThroughputStatisticsMeasurement: &ThroughputStatisticsMeasurement{
+					UlAverageThroughput: fmt.Sprintf("%.0f bps", m.ULThroughputBps),
+					DlAverageThroughput: fmt.Sprintf("%.0f bps", m.DLThroughputBps),
+				},
+			}
+			item.UserDataUsageMeasurements = []UserDataUsageMeasurements{measurement}
+		}
+
+		notificationItems = append(notificationItems, item)
 	}
 
-	payload := notifyPayload{
-		SubscriptionID: subscription.ID,
-		EventID:        string(subscription.Event),
-		Granularity:    string(subscription.Granularity),
-		Timestamp:      time.Now(),
-		Items:          items,
+	payload := NotificationData{
+		NotificationItems: notificationItems,
+		CorrelationId:     subscription.NotifyCorrelationID,
 	}
 
 	bodyBytes, err := json.Marshal(payload)
@@ -141,7 +173,7 @@ func (notifier *Notifier) Notify(subscription *Subscription, measures []UsageMea
 			zap.String("subscriptionId", subscription.ID),
 			zap.String("notifUri", subscription.NotifURI),
 			zap.Error(err),
-			zap.Int("items", len(items)),
+			zap.Int("items", len(payload.NotificationItems)),
 		)
 		return fmt.Errorf("notify: http request failed: %w", err)
 	}
@@ -163,7 +195,6 @@ func (notifier *Notifier) Notify(subscription *Subscription, measures []UsageMea
 		if limit <= 0 {
 			limit = 4096
 		}
-		// Regardless of the value of ContentLength, always use limited read and check for read errors.
 		bodyLimited := io.LimitReader(resp.Body, limit)
 		bodyBytes, readErr := io.ReadAll(bodyLimited)
 		if readErr != nil {
@@ -178,7 +209,7 @@ func (notifier *Notifier) Notify(subscription *Subscription, measures []UsageMea
 			zap.String("subscriptionId", subscription.ID),
 			zap.String("notifUri", subscription.NotifURI),
 			zap.Int("statusCode", resp.StatusCode),
-			zap.Int("items", len(items)),
+			zap.Int("items", len(payload.NotificationItems)),
 			zap.String("response", snippet),
 		)
 		return fmt.Errorf("notify: non-2xx response: %s", resp.Status)
@@ -188,7 +219,7 @@ func (notifier *Notifier) Notify(subscription *Subscription, measures []UsageMea
 	notifier.logger.Debug("ees notify success",
 		zap.String("subscriptionId", subscription.ID),
 		zap.String("notifUri", subscription.NotifURI),
-		zap.Int("items", len(items)),
+		zap.Int("items", len(payload.NotificationItems)),
 	)
 
 	return nil

@@ -1,16 +1,13 @@
 package main
 
 import (
-	"context"
 	"math/rand"
 	"os"
 	"runtime/debug"
 	"time"
 
 	"github.com/urfave/cli/v2"
-	"go.uber.org/zap"
 
-	"github.com/free5gc/go-upf/internal/ees"
 	"github.com/free5gc/go-upf/internal/logger"
 	upfapp "github.com/free5gc/go-upf/pkg/app"
 	"github.com/free5gc/go-upf/pkg/factory"
@@ -63,53 +60,6 @@ func action(cliCtx *cli.Context) error {
 	cfg, err := factory.ReadConfig(cliCtx.String("config"))
 	if err != nil {
 		return err
-	}
-
-	if cfg.EES != nil && cfg.EES.Enabled {
-		// 1) Build Logger
-		eesLogger, zapErr := zap.NewDevelopment()
-		if zapErr != nil {
-			return zapErr
-		}
-
-		// 2) Establish the PFCP Source and set it as global (for the pfcp/report.go mirror to call)
-		staleAfter := 30
-		if cfg.EES.PeriodSec > 0 {
-			staleAfter = cfg.EES.PeriodSec * 3
-		}
-		pfcpSource := ees.NewPFCPSource(time.Duration(staleAfter) * time.Second)
-		ees.SetGlobalPFCPSource(pfcpSource)
-
-		// 3) Establish Store / Notifier / Aggregator
-		subscriptionStore := ees.NewSubscriptionStore("") // instance suffix can be filled with hostname abbreviation
-		notifier := ees.NewNotifier(eesLogger)
-		period := 10
-		if cfg.EES.PeriodSec > 0 {
-			period = cfg.EES.PeriodSec
-		}
-		aggregator := ees.NewAggregator(
-			pfcpSource,
-			subscriptionStore,
-			time.Duration(period)*time.Second,
-			notifier,
-			eesLogger,
-		)
-
-		// 4) Launch the Aggregator and the API Server
-		go aggregator.Run(context.Background())
-
-		listenAddr := cfg.EES.ListenAddr
-		if listenAddr == "" {
-			listenAddr = "127.0.0.1:8088"
-		}
-		apiServer := ees.NewServer(subscriptionStore, aggregator, eesLogger)
-		go func() {
-			if apiSrvErr := apiServer.Serve(listenAddr); apiSrvErr != nil {
-				logger.MainLog.Errorf("EES API server stopped: %v", apiSrvErr)
-			}
-		}()
-
-		logger.MainLog.Infof("EES enabled: listen=%s periodSec=%d", listenAddr, period)
 	}
 
 	upf, err := upfapp.NewApp(cfg)

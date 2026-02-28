@@ -1,80 +1,212 @@
-# UPF Event Exposure Service (EES) — MVP
+# UPF Event Exposure Service (EES)
 
-This repository adds a **minimal, standards-aligned Event Exposure Service (EES)** to `go-upf` for the **`USER_DATA_USAGE_MEASURES`** event over **Nupf_EventExposure**. It enables **periodic** and **on-demand** reporting of per-PDU-session usage (UL/DL bytes & packets, derived throughputs), suitable for **UE behavior monitoring and anomaly detection** demos.
-
-> **Design note:** All usage metrics are treated as **interval values over a measurement interval** defined by **`StartTime`** and **`EndTime`** (we do **not** use cumulative counters in the EES path).
+This repository implements the **Nupf_EventExposure** service for `go-upf` per **3GPP TS 29.564**. It enables NFs (SMF, NWDAF, PCF) to subscribe to UPF events such as user data usage measurements.
 
 ---
 
-## Contents
+## TS 29.564 Compliance Status
 
-* [What this MVP delivers](#what-this-mvp-delivers)
-* [Architecture](#architecture)
-* [Added & modified files](#added--modified-files)
-* [Configuration](#configuration)
-* [Running the demo](#running-the-demo)
-* [REST API](#rest-api)
-* [Notify payload](#notify-payload)
-* [Testing with a simple receiver](#testing-with-a-simple-receiver)
-* [Operational notes](#operational-notes)
-* [Future work](#future-work)
-* [Standards & references](#standards--references)
+### Supported Features
 
----
+| Feature | Status | Notes |
+|---------|--------|-------|
+| **Event Type** | | |
+| `USER_DATA_USAGE_MEASURES` | ✅ Supported | Volume + Throughput |
+| `USER_DATA_USAGE_TRENDS` | ⚠️ Partial | Schema only |
+| `QOS_MONITORING` | ❌ Not Implemented | |
+| `TSC_MNGT_INFO` | ❌ Not Implemented | |
+| **Measurement Types** | | |
+| `VOLUME_MEASUREMENT` | ✅ Supported | Bytes + Packets |
+| `THROUGHPUT_MEASUREMENT` | ✅ Supported | Avg bps |
+| `APPLICATION_RELATED_INFO` | ⚠️ Schema only | No DPI integration |
+| **Granularity** | | |
+| `PER_SESSION` | ✅ Supported | Default |
+| `PER_APPLICATION` | ⚠️ API only | Requires DPI |
+| `PER_FLOW` | ⚠️ API only | Requires DPI |
+| **Reporting Trigger** | | |
+| `PERIODIC` | ✅ Supported | Configurable period |
+| `ONE_TIME` | ✅ Supported | Immediate report |
+| **Targeting** | | |
+| `anyUe: true` | ✅ Supported | All sessions |
+| `ueIpAddress` | ✅ Supported | Specific UE |
+| `supi` / `gpsi` | ❌ Not Implemented | |
 
-## What this MVP delivers
+### Subscription Response Example
 
-* **Event:** `USER_DATA_USAGE_MEASURES`
-* **Granularity:** per-PDU-session
-* **Modes:** `PERIODIC` (every `PeriodSec`) and `ON_DEMAND` (one immediate report using current interval values, then periodic)
-* **Target:** `Any UE` (all active sessions)
-* **Data:** UL/DL bytes & packets per session over an interval, with optional UL/DL throughputs derived from `(delta bytes * 8) / (EndTime - StartTime)`
-* **Transport:** HTTP `POST` from UPF to subscriber’s `notifUri`
+When a subscription is created successfully, the API returns `201 Created` with a `Location` header and the following JSON body:
+
+```json
+{
+  "subscriptionId": "sub-1738483200000000000-0000",
+  "subscription": {
+    "nfId": "smf-01",
+    "eventList": [{
+      "type": "USER_DATA_USAGE_MEASURES",
+      "measurementTypes": ["VOLUME_MEASUREMENT", "THROUGHPUT_MEASUREMENT"],
+      "granularityOfMeasurement": "PER_SESSION"
+    }],
+    "eventNotifyUri": "http://127.0.0.1:9000/callback",
+    "notifyCorrelationId": "corr-session-001",
+    "eventReportingMode": {"trigger": "PERIODIC", "reportPeriod": 30},
+    "anyUe": true
+  }
+}
+```
+
+### Notification Payload (TS 29.564 Compliant)
+
+The notification is sent as HTTP POST to the `eventNotifyUri`:
+
+```json
+{
+  "notificationItems": [
+    {
+      "eventType": "USER_DATA_USAGE_MEASURES",
+      "timeStamp": "2026-01-14T12:00:00Z",
+      "ueIpv4Addr": "10.60.0.1",
+      "startTime": "2026-01-14T11:59:30Z",
+      "userDataUsageMeasurements": [
+        {
+          "volumeMeasurement": {
+            "totalVolume": 1572864,
+            "ulVolume": 524288,
+            "dlVolume": 1048576,
+            "totalNbOfPackets": 2000,
+            "ulNbOfPackets": 800,
+            "dlNbOfPackets": 1200
+          },
+          "throughputMeasurement": {
+            "ulThroughput": "139810 bps",
+            "dlThroughput": "279620 bps",
+            "ulPacketThroughput": "26.67 pps",
+            "dlPacketThroughput": "40.00 pps"
+          }
+        }
+      ]
+    }
+  ],
+  "correlationId": "corr-session-001"
+}
+```
+
+**Note**: The fields included depend on the `measurementTypes` in the subscription:
+- `VOLUME_MEASUREMENT` → includes `volumeMeasurement`
+- `THROUGHPUT_MEASUREMENT` → includes `throughputMeasurement`
 
 ---
 
 ## Architecture
 
+The EES uses a **Pure Push model** – SMF-provisioned URRs generate usage reports that are pushed from the kernel via Handler to the Aggregator. No Shadow URRs are created; we leverage existing SMF URR data.
+
 ```
-PFCP pipeline (URR / USAReport)
-           │
-           │  (interval counters per session: UL/DL bytes/packets + StartTime/EndTime)
-           ▼
-   ees.PFCPSource ─────────► ees.Aggregator (ticks every PeriodSec)
-                                      │
-                                      │ compute UsageMeasures from interval counters
-                                      ▼
-                             ees.Notifier  ──►  subscriber notifUri (HTTP POST)
-                               ^
-                               │
-                    ees.SubscriptionStore (in-memory)
+┌─────────────────────────────────────────────────────────────────┐
+│                           go-upf                                 │
+│                                                                  │
+│  ┌──────────┐    ┌────────────┐    ┌──────────┐                 │
+│  │API Server│───▶│ Aggregator │───▶│ Notifier │──▶ HTTP POST    │
+│  └──────────┘    └─────▲──────┘    └──────────┘                 │
+│                        │ PushReport                              │
+│                        │                                         │
+│                   ┌────┴─────┐                                  │
+│                   │ Handler  │◀── URR 2 (MAQE) Reports          │
+│                   └──────────┘                                  │
+│                        ▲                                         │
+│                        │ Periodic USA Reports                    │
+│  ┌──────────────────────────────────────────────────────────┐   │
+│  │                  gtp5g Kernel Module                      │   │
+│  └──────────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────┘
+```
+#### Changing file in smf `smf/internal/contet/pfcp_rules.go` is required
+```c
+func NewVolumeThreshold(threshold uint64) UrrOpt {
+        return func(urr *URR) {
+                if threshold > 0 { //new logic
+                        urr.ReportingTrigger.Volth = true
+                        urr.VolumeThreshold = threshold
+                }
+        }
+}
 ```
 
-* **Single source of truth:** We mirror the **existing PFCP USAReport interval data** into EES (no duplicate counters).
-* **Interval semantics:** Every record carries **`StartTime`**/`EndTime` for the measurement interval.
-* **Simple cleanup:** On each tick, the aggregator removes session snapshots that **do not appear** in the current `SnapshotNow()` result (keeps memory tidy).
+**Data Flow**:
+1. SMF provisions URR 2 (N3N6_MAQE) for sessions via PFCP
+2. Kernel pushes periodic USA reports to Handler
+3. Handler calls `Aggregator.PushReport()` to buffer reports
+4. Aggregator consolidates and dispatches notifications per subscription period
 
----
+### Subscription to Notification Flow
 
-## Added & modified files
+```mermaid
+sequenceDiagram
+    participant NF as NF (SMF/NWDAF/PCF)
+    participant API as API Server
+    participant Store as Subscription Store
+    participant Kernel as gtp5g Kernel Module
+    participant Handler as EES Handler
+    participant Aggregator as Aggregator
+    participant Notifier as Notifier
 
-### New (under `internal/ees/`)
+    %% 顏色定義 (使用淺色系)
+    rect rgb(240, 248, 255)
+    Note over NF,Kernel: Pre Phase : SMF 透過 PFCP 設置 URR
+    NF->>Kernel: PFCP Session Establishment<br/>設置 URR 2 (N3N6_MAQE, MAQE)
+    Note over Kernel: Kernel 開始收集流量統計<br/>(UL/DL bytes, packets)
+    end
 
-* `types.go` – core types (event IDs, granularity, modes, keys, counters, usage measures, subscription, `Source` interface)
-* `subscription_store.go` – thread-safe in-memory store for subscriptions (Create/Delete/Get/All)
-* `notifier.go` – builds and sends JSON Notify payloads (HTTP POST) with concise, structured logging
-* `source_pfcp.go` – implements `Source`; mirrors PFCP USAReport interval data via `OnUSAReport(...)`; `SnapshotNow()` returns a copy of current session counters; includes a simple staleness pruning
-* `api.go` – minimal REST server:
+    rect rgb(255, 250, 230)
+    %% Phase 1: 訂閱創建
+    Note over NF,API: Phase 1: 訂閱創建
+    NF->>+API: POST /nupf-ee/v1/ee-subscriptions<br/>(eventType, measurementTypes, notifyUri, reportPeriod)
+    API->>API: validateAndBuildSubscription()<br/>驗證參數、granularity、targeting
+    API->>Store: AddSubscription()
+    Store-->>API: subscriptionId
+    API->>Aggregator: AdjustReportPeriod(urrPeriod)
+    Note over Aggregator: 當第一個訂閱建立時<br/>調整報告週期為 URR 週期
+    API-->>-NF: 201 Created<br/>Location: /ee-subscriptions/{id}<br/>返回 subscriptionId
+    end
 
-  * `POST /nupf-ee/v1/ee-subscriptions` (create)
-  * `DELETE /nupf-ee/v1/ee-subscriptions/{id}` (delete)
-* `aggregator.go` – periodic/on-demand scheduling, diffing from snapshots, throughput derivation, and per-tick cleanup
+    rect rgb(245, 255, 245)
+    %% Phase 2: 週期性報告推送
+    Note over Kernel,Notifier: Phase 2: 週期性數據報告 (Pure Push Model)
+    loop 每個 URR 週期 (例如 10 秒)
+        Kernel->>Handler: Push SessReport<br/>(SEID, URR Reports with usage data)
+        Handler->>Handler: NotifySessReport()
+        Handler->>Aggregator: PushReport(sessRpt)
+        Note over Aggregator: 將報告存入 reportBuffer<br/>按 SessionKey 分組
+        Aggregator->>Aggregator: matchesSubscription()<br/>檢查是否匹配訂閱的 UE
+        Aggregator->>Aggregator: computeThroughputIfPossible()
+    end
+    end
 
-### Modified integration points
+    rect rgb(255, 240, 245)
+    %% Phase 3: 聚合與通知
+    Note over Aggregator,Notifier: Phase 3: 聚合與通知發送
+    loop 每個訂閱的 reportPeriod (例如 30 秒)
+        Aggregator->>Aggregator: TickOnce()
+        Note over Aggregator: 檢查訂閱是否到達通知時間
+        Aggregator->>Aggregator: consolidateReports()<br/>合併同一 session 的多個報告
+        Note over Aggregator: 將多個 URR 週期的數據求和
+        Aggregator->>Notifier: Notify(subscription, measures)
+        Notifier->>Notifier: 構建 NotificationData
+        Notifier->>NF: HTTP POST to notifyUri
+        NF-->>Notifier: 200 OK
+        Notifier-->>Aggregator: Success
+        Note over Aggregator: 更新 lastNotificationTime
+        Aggregator->>Aggregator: 清空該訂閱的 reportBuffer
+    end
+    end
 
-* `internal/pfcp/report.go` – **mirror** the already-computed per-session **interval** counters (UL/DL bytes, packets, StartTime, EndTime) into `ees.PFCPSource.OnUSAReport(...)` (does **not** change PFCP behavior)
-* `pkg/factory/config.go` / `pkg/factory/factory.go` – add `EES` config section and validation
-* `cmd/main.go` – wire up `PFCPSource`, `SubscriptionStore`, `Notifier`, `Aggregator`, start EES API server if `EES.Enabled`
+    rect rgb(245, 245, 245)
+    %% Case : 訂閱刪除
+    Note over NF,Store: Case : 訂閱刪除
+    NF->>API: DELETE /nupf-ee/v1/ee-subscriptions/{id}
+    API->>Store: RemoveSubscription(id)
+    Store-->>API: Success
+    API-->>NF: 204 No Content
+    end
+```
 
 ---
 
@@ -85,209 +217,156 @@ In `upfcfg.yaml`:
 ```yaml
 EES:
   Enabled: true
-  ListenAddr: "0.0.0.0:8088"  # EES HTTP server (create/delete subscriptions)
-  PeriodSec: 10               # aggregator tick interval
-  LogLevel: "debug"           # inherits global when empty
-```
-
-> **Staleness rule:** `PFCPSource` prunes sessions that have not produced interval data for ~`PeriodSec * 3` (configurable in code for MVP). We also remove missing sessions from each subscription’s snapshots after every tick.
-
----
-
-## Running the demo
-
-1. **Build & run UPF** (ensure your standard `go-upf` prerequisites are met):
-
-```bash
-# From the repo root
-make
-./bin/upf -c ./config/upfcfg.yaml
-```
-
-2. **Start a simple receiver** (see below) on the same host (or adjust `notifUri` accordingly):
-
-```bash
-python3 receiver.py  # listens on http://127.0.0.1:9000/callback
+  ListenAddr: "0.0.0.0:8088"
+  PeriodSec: 10
 ```
 
 ---
 
 ## REST API
 
-### Create a subscription
+### Create Subscription
 
 `POST /nupf-ee/v1/ee-subscriptions`
 
-**Request (MVP):**
+**Response**: `201 Created` with `Location` header containing the subscription URI.
 
-```json
-{
-  "notifUri": "http://127.0.0.1:9000/callback",
-  "event": "USER_DATA_USAGE_MEASURES",
-  "granularity": "perPduSession",
-  "mode": "ON_DEMAND",                 // or "PERIODIC"
-  "periodSec": 10,
-  "target": { "anyUe": true }
-}
-```
-
-**Response (201):**
-
-```json
-{ "subscriptionId": "sub-1730023456789012345-0001" }
-```
-
-> **ON_DEMAND**: sends one immediate report using the current interval values, then continues with periodic reporting every `periodSec`.
-
-### Delete a subscription
+### Delete Subscription
 
 `DELETE /nupf-ee/v1/ee-subscriptions/{subscriptionId}`
 
-* Returns `204 No Content` for successful deletion.
+**Response**: `204 No Content`
 
 ---
 
-## Notify payload
+## Example Subscription Payloads
 
-EES posts the following JSON to each subscription’s `notifUri`:
+### 1. PER_SESSION (Default)
 
-```json
-{
-  "subscriptionId": "sub-1730023456789012345-0001",
-  "eventId": "USER_DATA_USAGE_MEASURES",
-  "granularity": "perPduSession",
-  "timestamp": "2025-10-29T13:00:00Z",
-  "items": [
-    {
-      "localSeid":  12345,
-      "remoteSeid": 67890,
-      "ulBytes":  1048576,
-      "dlBytes":  524288,
-      "ulPackets": 1200,
-      "dlPackets": 800,
-      "startTime": "2025-10-29T12:59:50Z",
-      "endTime":   "2025-10-29T13:00:00Z",
-      "ulThroughputBps": 838860.8,
-      "dlThroughputBps": 419430.4
+```bash
+curl -X POST http://127.0.0.1:8088/nupf-ee/v1/ee-subscriptions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "subscription": {
+      "nfId": "smf-01",
+      "eventList": [{
+        "type": "USER_DATA_USAGE_MEASURES",
+        "measurementTypes": ["VOLUME_MEASUREMENT", "THROUGHPUT_MEASUREMENT"],
+        "granularityOfMeasurement": "PER_SESSION"
+      }],
+      "eventNotifyUri": "http://127.0.0.1:9000/callback",
+      "notifyCorrelationId": "corr-session-001",
+      "eventReportingMode": {"trigger": "PERIODIC", "reportPeriod": 30},
+      "anyUe": true
     }
-  ]
-}
+  }'
 ```
 
-* **Interval semantics:** Each item covers exactly the measurement interval `[StartTime, EndTime]`.
-* **Throughput fields** are optional and may be omitted when not computed.
-
----
-
-## Testing with a simple receiver
-
-`receiver.py` (example) listens on `http://127.0.0.1:9000/callback`, prints the full JSON, and replies with `204`:
+### 2. PER_APPLICATION (API validation only, requires DPI for data)
 
 ```bash
-python3 receiver.py
-```
-
-### Create ON_DEMAND (immediate report, then periodic every 10s)
-
-```bash
-curl -sS -X POST http://127.0.0.1:8088/nupf-ee/v1/ee-subscriptions \
+curl -X POST http://127.0.0.1:8088/nupf-ee/v1/ee-subscriptions \
   -H 'Content-Type: application/json' \
   -d '{
-        "notifUri": "http://127.0.0.1:9000/callback",
-        "event": "USER_DATA_USAGE_MEASURES",
-        "granularity": "perPduSession",
-        "mode": "ON_DEMAND",
-        "periodSec": 10,
-        "target": { "anyUe": true }
-      }'
+    "subscription": {
+      "nfId": "nwdaf-01",
+      "eventList": [{
+        "type": "USER_DATA_USAGE_MEASURES",
+        "measurementTypes": ["VOLUME_MEASUREMENT"],
+        "granularityOfMeasurement": "PER_APPLICATION",
+        "appIds": ["app-youtube", "app-netflix"]
+      }],
+      "eventNotifyUri": "http://127.0.0.1:9000/callback",
+      "notifyCorrelationId": "corr-app-001",
+      "eventReportingMode": {"trigger": "PERIODIC", "reportPeriod": 60},
+      "anyUe": true
+    }
+  }'
 ```
 
-### Create PERIODIC (every 10s)
+### 3. PER_FLOW (API validation only, requires DPI for data)
 
 ```bash
-curl -sS -X POST http://127.0.0.1:8088/nupf-ee/v1/ee-subscriptions \
+curl -X POST http://127.0.0.1:8088/nupf-ee/v1/ee-subscriptions \
   -H 'Content-Type: application/json' \
   -d '{
-        "notifUri": "http://127.0.0.1:9000/callback",
-        "event": "USER_DATA_USAGE_MEASURES",
-        "granularity": "perPduSession",
-        "mode": "PERIODIC",
-        "periodSec": 10,
-        "target": { "anyUe": true }
-      }'
+    "subscription": {
+      "nfId": "pcf-01",
+      "eventList": [{
+        "type": "USER_DATA_USAGE_MEASURES",
+        "measurementTypes": ["VOLUME_MEASUREMENT"],
+        "granularityOfMeasurement": "PER_FLOW",
+        "trafficFilters": [
+          {"flowDescription": "permit in ip from any to 10.0.0.0/8", "flowDirection": "DOWNLINK"}
+        ]
+      }],
+      "eventNotifyUri": "http://127.0.0.1:9000/callback",
+      "notifyCorrelationId": "corr-flow-001",
+      "eventReportingMode": {"trigger": "PERIODIC", "reportPeriod": 10},
+      "ueIpAddress": "10.60.0.1"
+    }
+  }'
 ```
 
-### Delete
+### 4. ONE_TIME (Immediate Report)
 
 ```bash
-curl -sS -X DELETE http://127.0.0.1:8088/nupf-ee/v1/ee-subscriptions/SUB_ID
+curl -X POST http://127.0.0.1:8088/nupf-ee/v1/ee-subscriptions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "subscription": {
+      "nfId": "smf-01",
+      "eventList": [{
+        "type": "USER_DATA_USAGE_MEASURES",
+        "measurementTypes": ["VOLUME_MEASUREMENT"]
+      }],
+      "eventNotifyUri": "http://127.0.0.1:9000/callback",
+      "notifyCorrelationId": "corr-onetime-001",
+      "eventReportingMode": {"trigger": "ONE_TIME"},
+      "ueIpAddress": "10.60.0.1"
+    }
+  }'
 ```
 
 ---
 
-## Operational notes
+## Validation Rules
 
-* **Interval vs. cumulative:** EES uses **interval** counters mirrored from PFCP; PFCP behavior is unchanged.
-* **Cleanup strategy:**
-
-  * `PFCPSource` prunes sessions that have not produced data for a while (approx. `PeriodSec * 3`).
-  * After each tick, the aggregator drops session snapshots that are absent in the latest `SnapshotNow()`.
-* **Observability:** EES logs include `subscriptionId`, `localSeid`, `remoteSeid`, `startTime`, `endTime`, item counts, and HTTP status codes for Notify results.
-* **Safety:** No retries and no authentication in MVP (keep it simple). Add these when integrating with real NWDAF/AF.
-
----
-
-## Future work
-
-* **Precise on-demand trigger:** `aggregator.NotifyOnceFor(subscriptionId)` to avoid affecting other subscriptions when creating an `ON_DEMAND` one.
-* **Dependency injection for PFCPSource:** Replace the temporary global with injected interfaces at PFCP report aggregation points; improves testability and multi-instance hygiene.
-* **Configurable staleness:** Expose `staleAfter` in YAML; log the effective `PeriodSec` and `staleAfter` at startup.
-* **Targets & filters:** Add UE IP (from PDR) and later DNN/S-NSSAI / application filters; align with Nupf_EventExposure targeting rules.
-* **Termination & remaining data:** On N4 session release, send a final report with a termination cause and any remaining data for the last interval.
-* **Security & robustness:** Auth (token or mTLS), bounded retries with backoff/jitter, structured error classes, and counters for success/failure.
-* **API expansion:** `GET`/`PATCH` for subscription query/update; `/healthz` and `/version` endpoints.
-* **NRF Registration for UPF EES**
-  UPF EES should register its NF Profile to NRF (NF type = `UPF`) including:
-
-  * Supported service: **Nupf_EventExposure**
-  * Supported measurement types (e.g., `USER_DATA_USAGE_MEASURES`)
-  * Connectivity information (`nfService`, `ipEndPoints`, `fqdn`)
-    This enables other NFs such as **NWDAF** and **DCCF** to discover UPF EES dynamically.
-
-* **NRF-Based NF Discovery for Consumers**
-  NWDAF or DCCF, acting as EES consumers, should use **Nnrf_NFDiscovery_Request** to locate UPF instances based on:
-
-  * S-NSSAI
-  * DNN
-  * DNAI
-  * UPF capabilities (e.g., user-data-usage-measurements support)
-    This aligns with TS 23.502 §4.15.4.5 (Nnrf-based UPF selection for analytics subscription).
-
-* **Indirect Subscription via SMF with NRF Lookups**
-  When NWDAF subscribes indirectly through SMF, SMF should:
-
-  * Query NRF to determine the appropriate UPF for a given PDU session,
-  * Then send `Nupf_EventExposure_Subscribe` to that UPF.
-    This ensures correct UPF selection even in multi-UPF deployments.
-
-* **UE-IP Direct Subscription (NRF-Assisted Routing)**
-  For *Certain UE* targeting (UE IP or SUPI), future EES extensions should:
-
-  * Determine the serving UPF using NRF discovery (TS 23.502 §4.15.4.5.5),
-  * Route the direct subscription to the correct UPF instance.
-
-* **NRF Operation Observability**
-  Add structured logs and metrics for:
-
-  * NRF registration lifecycle
-  * Heartbeats
-  * NFDiscovery requests & results
-  * UPF service availability updates
-    This helps debug distributed deployments and UPF selection behavior.
+| Condition | Requirement |
+|-----------|-------------|
+| `type = USER_DATA_USAGE_MEASURES` | `measurementTypes` is mandatory |
+| `granularityOfMeasurement = PER_APPLICATION` | `appIds` is mandatory |
+| `granularityOfMeasurement = PER_FLOW` | `trafficFilters` is mandatory |
+| Targeting | Either `anyUe: true` OR `ueIpAddress` |
+| `reportPeriod` (PERIODIC mode) | Must be ≥ URR period and a multiple of it |
 
 ---
 
-## Standards & references
+## Key Files
 
-* **3GPP Nupf_EventExposure** — *User Data Usage Measures* event (per-session/flow/application), periodic and immediate reporting semantics.
-* **go-upf PFCP** — URR / USAReport interval measurement as the single source mirrored into EES.
+| File | Purpose |
+|------|---------|
+| `internal/ees/api.go` | REST API handlers and subscription validation |
+| `internal/ees/aggregator.go` | Report buffering, consolidation, and periodic dispatch |
+| `internal/ees/handler.go` | Receives kernel URR reports and forwards to Aggregator |
+| `internal/ees/notifier.go` | TS 29.564 payload construction and HTTP delivery |
+| `internal/ees/subscription_store.go` | Thread-safe in-memory subscription management |
+| `internal/ees/types.go` | Data structures and type definitions |
+
+---
+
+## Future Work
+* Add support for `USER_DATA_USAGE_TRENDS`
+* Add support for `QOS_MONITORING`
+* Add support for `TSC_MNGT_INFO`
+* Add support for `PER_APPLICATION` and `PER_FLOW` using standalone mechanism
+* Add support for `ONE_TIME`
+* Add support for `supi` / `gpsi` (If smf supports)
+
+---
+
+## Standards References
+
+- **3GPP TS 29.564** — Nupf_EventExposure API
+- **3GPP TS 29.244** — PFCP (URR, Usage Reporting)
+- **3GPP TS 29.512** — FlowInformation schema

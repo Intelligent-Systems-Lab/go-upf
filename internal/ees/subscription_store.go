@@ -58,8 +58,15 @@ func (store *SubscriptionStore) CreateSubscription(newSubscription *Subscription
 	if newSubscription.Mode == "" {
 		return "", fmt.Errorf("%w: missing Mode", ErrInvalidSubscription)
 	}
-	if newSubscription.PeriodSec <= 0 {
-		return "", fmt.Errorf("%w: PeriodSec must be > 0", ErrInvalidSubscription)
+	// PeriodSec is only required for PERIODIC mode
+	if newSubscription.Mode == ModePeriodic && newSubscription.PeriodSec <= 0 {
+		return "", fmt.Errorf("%w: PeriodSec must be > 0 for PERIODIC mode", ErrInvalidSubscription)
+	}
+	if newSubscription.NfID == "" {
+		return "", fmt.Errorf("%w: missing NfID", ErrInvalidSubscription)
+	}
+	if newSubscription.NotifyCorrelationID == "" {
+		return "", fmt.Errorf("%w: missing NotifyCorrelationID", ErrInvalidSubscription)
 	}
 
 	subscriptionID := store.generateSubscriptionID()
@@ -68,7 +75,7 @@ func (store *SubscriptionStore) CreateSubscription(newSubscription *Subscription
 	// initialize internal bookkeeping fields
 	newSubscription.ID = subscriptionID
 	newSubscription.CreatedAt = now
-	newSubscription.LastNotify = time.Time{} // zero means "never"
+	newSubscription.LastNotify = now // Initialize to now to avoid time overflow
 	if newSubscription.Snapshots == nil {
 		newSubscription.Snapshots = make(map[SessionKey]Counters)
 	}

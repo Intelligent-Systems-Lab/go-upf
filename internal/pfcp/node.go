@@ -8,6 +8,7 @@ import (
 	"github.com/sirupsen/logrus"
 	"github.com/wmnsk/go-pfcp/ie"
 
+	"github.com/free5gc/go-upf/internal/ees"
 	"github.com/free5gc/go-upf/internal/forwarder"
 	"github.com/free5gc/go-upf/internal/report"
 	logger_util "github.com/free5gc/util/logger"
@@ -30,17 +31,18 @@ type URRInfo struct {
 }
 
 type Sess struct {
-	rnode    *RemoteNode
-	LocalID  uint64
-	RemoteID uint64
-	PDRIDs   map[uint16]*PDRInfo    // key: PDR_ID
-	FARIDs   map[uint32]struct{}    // key: FAR_ID
-	QERIDs   map[uint32]struct{}    // key: QER_ID
-	URRIDs   map[uint32]*URRInfo    // key: URR_ID
-	BARIDs   map[uint8]struct{}     // key: BAR_ID
-	q        map[uint16]chan []byte // key: PDR_ID
-	qlen     int
-	log      *logrus.Entry
+	rnode      *RemoteNode
+	LocalID    uint64
+	RemoteID   uint64
+	UeIPv4Addr string                 // Added: UE IPv4 Address derived from PDR
+	PDRIDs     map[uint16]*PDRInfo    // key: PDR_ID
+	FARIDs     map[uint32]struct{}    // key: FAR_ID
+	QERIDs     map[uint32]struct{}    // key: QER_ID
+	URRIDs     map[uint32]*URRInfo    // key: URR_ID
+	BARIDs     map[uint8]struct{}     // key: BAR_ID
+	q          map[uint16]chan []byte // key: PDR_ID
+	qlen       int
+	log        *logrus.Entry
 }
 
 func (s *Sess) Close() []report.USAReport {
@@ -119,6 +121,19 @@ func (s *Sess) CreatePDR(req *ie.IE) error {
 			urrInfo, ok := s.URRIDs[v]
 			if ok {
 				urrInfo.refPdrNum++
+			}
+		case ie.PDI:
+			pdi, err1 := i.PDI()
+			if err1 == nil {
+				for _, subIE := range pdi {
+					if subIE.Type == ie.UEIPAddress {
+						if ueIP, err2 := subIE.UEIPAddress(); err2 == nil {
+							if ueIP.IPv4Address != nil {
+								s.UeIPv4Addr = ueIP.IPv4Address.String()
+							}
+						}
+					}
+				}
 			}
 		}
 	}
@@ -687,4 +702,53 @@ func (n *LocalNode) DeleteSess(lSeid uint64) ([]report.USAReport, error) {
 	n.sess[i] = nil
 	n.free = append(n.free, lSeid)
 	return usars, nil
+}
+
+// [New] Implement ees.SessionProvider interface
+// Allow EES to obtain the context of active Sessions (RemoteSEID and URRIDs)
+func (n *LocalNode) GetSessionContexts() map[uint64]ees.SessionContext {
+	// If concurrency safety is needed, it is recommended to add a lock here (n.sess may change during operation)
+	// But for MVP, if there is no high-risk scenario of concurrent Session deletion, it can be omitted temporarily
+
+	result := make(map[uint64]ees.SessionContext)
+
+	for _, sess := range n.sess {
+		if sess == nil {
+			continue
+		}
+
+		// Collect all URR IDs under this Session
+		var urrIDs []uint32
+		if sess.URRIDs != nil {
+			for urrID := range sess.URRIDs {
+				urrIDs = append(urrIDs, urrID)
+			}
+		}
+
+		// Only monitor when Session has URR (or decide whether to include empty Session based on requirements)
+		if len(urrIDs) > 0 {
+			// Populate PDRs
+			var pdrs []*ees.PDRContext
+
+			// Correct iteration over PDRIDs map
+			for pdrID, pdrInfo := range sess.PDRIDs {
+				var pdrURRIDs []uint32
+				for uid := range pdrInfo.RelatedURRIDs {
+					pdrURRIDs = append(pdrURRIDs, uid)
+				}
+				pdrs = append(pdrs, &ees.PDRContext{
+					PDRID:  pdrID,
+					URRIDs: pdrURRIDs,
+				})
+			}
+
+			result[sess.LocalID] = ees.SessionContext{
+				RemoteSEID: sess.RemoteID,
+				UeIPv4Addr: sess.UeIPv4Addr,
+				URRIDs:     urrIDs,
+				PDRs:       pdrs,
+			}
+		}
+	}
+	return result
 }
