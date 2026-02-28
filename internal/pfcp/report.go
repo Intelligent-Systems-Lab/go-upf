@@ -8,7 +8,6 @@ import (
 	"github.com/wmnsk/go-pfcp/ie"
 	"github.com/wmnsk/go-pfcp/message"
 
-	"github.com/free5gc/go-upf/internal/ees"
 	"github.com/free5gc/go-upf/internal/report"
 	"github.com/free5gc/go-upf/pkg/factory"
 )
@@ -106,6 +105,7 @@ func (s *PfcpServer) serveUSAReport(addr net.Addr, lSeid uint64, usars []report.
 		0,
 		ie.NewReportType(0, 0, 1, 0),
 	)
+	s.log.Infof("number of usars is : %d", len(usars))
 	for _, r := range usars {
 		urrInfo, ok := sess.URRIDs[r.URRID]
 		if !ok {
@@ -113,44 +113,12 @@ func (s *PfcpServer) serveUSAReport(addr net.Addr, lSeid uint64, usars []report.
 			continue
 		}
 		r.URSEQN = sess.URRSeq(r.URRID)
+
 		req.UsageReport = append(req.UsageReport,
 			ie.NewUsageReportWithinSessionReportRequest(
 				r.IEsWithinSessReportReq(
 					urrInfo.MeasureMethod, urrInfo.MeasureInformation)...,
 			))
-		if ees.GlobalPFCPSource != nil {
-			ees.GlobalPFCPSource.OnUSAReport(
-				ees.SessionKey{
-					LocalSEID:  lSeid,
-					RemoteSEID: sess.RemoteID,
-				},
-				r.URRID,
-				ees.Counters{
-					ULBytes:   r.VolumMeasure.UplinkVolume,
-					DLBytes:   r.VolumMeasure.DownlinkVolume,
-					ULPackets: r.VolumMeasure.UplinkPktNum,
-					DLPackets: r.VolumMeasure.DownlinkPktNum,
-					StartTime: r.StartTime,
-					EndTime:   r.EndTime,
-				},
-			)
-
-			s.log.Debugf(
-				"serveUSAReport: EES mirror OK, LocalSEID(%#x), RemoteSEID(%#x), "+
-					"URRID(%#x), URSEQN(%d), ULBytes(%d), DLBytes(%d), "+
-					"ULPackets(%d), DLPackets(%d), StartTime(%v), EndTime(%v)",
-				lSeid, sess.RemoteID, r.URRID, r.URSEQN,
-				r.VolumMeasure.UplinkVolume, r.VolumMeasure.DownlinkVolume,
-				r.VolumMeasure.UplinkPktNum, r.VolumMeasure.DownlinkPktNum,
-				r.StartTime, r.EndTime,
-			)
-		} else {
-			s.log.Debugf(
-				"serveUSAReport: EES mirror skipped (GlobalPFCPSource is nil), "+
-					"LocalSEID(%#x), RemoteSEID(%#x), URRID(%#x), URSEQN(%d)",
-				lSeid, sess.RemoteID, r.URRID, r.URSEQN,
-			)
-		}
 	}
 
 	err = s.sendReqTo(req, addr)
