@@ -262,11 +262,36 @@ func convertSlice(ports [][]uint16) []byte {
 func (g *Gtp5g) newSdfFilter(i *ie.IE, srcIf uint8) (nl.AttrList, error) {
 	var attrs nl.AttrList
 
-	v, err := i.SDFFilter()
-	if err != nil {
-		return nil, err
+	// i.Payload[0] corresponds to Octet 5 (Flags) in the spec
+	flags := i.Payload[0]
+	hasFD := (flags & 0x01) != 0 // Bit 1: Flow Description
+	offset := 2
+
+	if hasFD {
+		if len(i.Payload) < offset+2 {
+			return nil, errors.New("SDF Filter IE with FD flag needs Length of Flow Description")
+		}
+		// Read FDLength from i.Payload[2-3] (Octets 7-8 in spec)
+		fdLength := uint16(i.Payload[offset])<<8 | uint16(i.Payload[offset+1])
+
+		// Validate FDLength doesn't exceed available payload
+		// Flow Description data starts at i.Payload[4] (Octet 9)
+		flowDescStart := offset + 2
+		availableBytes := len(i.Payload) - flowDescStart
+		if int(fdLength) > availableBytes {
+			return nil, errors.Errorf(
+				"SDF Filter FDLength %d exceeds available payload %d bytes",
+				fdLength, availableBytes)
+		}
 	}
 
+	// Now it's safe to parse - the payload has been pre-validated
+	v, err := i.SDFFilter()
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to parse SDF Filter")
+	}
+
+	// Process validated SDF Filter fields
 	if v.HasFD() {
 		swapSrcDst := (srcIf == ie.SrcInterfaceAccess)
 		fd, err := g.newFlowDesc(v.FlowDescription, swapSrcDst)
@@ -278,6 +303,7 @@ func (g *Gtp5g) newSdfFilter(i *ie.IE, srcIf uint8) (nl.AttrList, error) {
 			Value: fd,
 		})
 	}
+
 	if v.HasTTC() {
 		// TODO:
 		// v.ToSTrafficClass string
@@ -366,6 +392,12 @@ func (g *Gtp5g) newPdi(i *ie.IE) (nl.AttrList, error) {
 				Value: nl.AttrBytes(v.IPv4Address),
 			})
 		case ie.SDFFilter:
+			// Validate SDF Filter IE payload length early (TS 29.244 Section 8.2.5)
+			// Minimum: 1 byte (flags) + 1 byte (spare) + at least 1 byte for content
+			if len(x.Payload) < 3 {
+				logger.FwderLog.Warnf("SDF Filter IE payload too short: %d bytes (minimum 3)", len(x.Payload))
+				return nil, errors.Errorf("SDF Filter IE payload too short: %d bytes (minimum 3)", len(x.Payload))
+			}
 			sdfIEs = append(sdfIEs, x)
 		case ie.ApplicationID:
 		}
@@ -373,12 +405,15 @@ func (g *Gtp5g) newPdi(i *ie.IE) (nl.AttrList, error) {
 
 	for _, x := range sdfIEs {
 		v, err := g.newSdfFilter(x, srcIf)
-		if err == nil {
-			attrs = append(attrs, nl.Attr{
-				Type:  gtp5gnl.PDI_SDF_FILTER,
-				Value: v,
-			})
+		if err != nil {
+			// Log the error and return it instead of silently ignoring
+			logger.FwderLog.Warnf("Failed to parse SDF Filter: %v", err)
+			return nil, errors.Wrap(err, "newSdfFilter failed")
 		}
+		attrs = append(attrs, nl.Attr{
+			Type:  gtp5gnl.PDI_SDF_FILTER,
+			Value: v,
+		})
 	}
 
 	return attrs, nil
@@ -398,13 +433,13 @@ func (g *Gtp5g) CreatePDR(lSeid uint64, req *ie.IE) error {
 		case ie.PDRID:
 			v, err := i.PDRID()
 			if err != nil {
-				break
+				return errors.Wrap(err, "CreatePDR: failed to parse PDRID")
 			}
 			pdrid = uint64(v)
 		case ie.Precedence:
 			v, err := i.Precedence()
 			if err != nil {
-				break
+				return errors.Wrap(err, "CreatePDR: failed to parse Precedence")
 			}
 			attrs = append(attrs, nl.Attr{
 				Type:  gtp5gnl.PDR_PRECEDENCE,
@@ -413,7 +448,7 @@ func (g *Gtp5g) CreatePDR(lSeid uint64, req *ie.IE) error {
 		case ie.PDI:
 			v, err := g.newPdi(i)
 			if err != nil {
-				break
+				return errors.Wrap(err, "CreatePDR: failed to parse PDI")
 			}
 			if v != nil {
 				attrs = append(attrs, nl.Attr{
@@ -424,7 +459,7 @@ func (g *Gtp5g) CreatePDR(lSeid uint64, req *ie.IE) error {
 		case ie.OuterHeaderRemoval:
 			v, err := i.OuterHeaderRemovalDescription()
 			if err != nil {
-				break
+				return errors.Wrap(err, "CreatePDR: failed to parse OuterHeaderRemoval")
 			}
 			attrs = append(attrs, nl.Attr{
 				Type:  gtp5gnl.PDR_OUTER_HEADER_REMOVAL,
@@ -434,7 +469,7 @@ func (g *Gtp5g) CreatePDR(lSeid uint64, req *ie.IE) error {
 		case ie.FARID:
 			v, err := i.FARID()
 			if err != nil {
-				break
+				return errors.Wrap(err, "CreatePDR: failed to parse FARID")
 			}
 			attrs = append(attrs, nl.Attr{
 				Type:  gtp5gnl.PDR_FAR_ID,
@@ -443,6 +478,8 @@ func (g *Gtp5g) CreatePDR(lSeid uint64, req *ie.IE) error {
 		case ie.QERID:
 			v, err := i.QERID()
 			if err != nil {
+				// QER is optional, log but continue
+				logger.FwderLog.Warnf("CreatePDR: Failed to parse QERID: %v", err)
 				break
 			}
 			attrs = append(attrs, nl.Attr{
@@ -452,6 +489,8 @@ func (g *Gtp5g) CreatePDR(lSeid uint64, req *ie.IE) error {
 		case ie.URRID:
 			v, err := i.URRID()
 			if err != nil {
+				// URR is optional, log but continue
+				logger.FwderLog.Warnf("CreatePDR: Failed to parse URRID: %v", err)
 				break
 			}
 			attrs = append(attrs, nl.Attr{
@@ -492,12 +531,14 @@ func (g *Gtp5g) UpdatePDR(lSeid uint64, req *ie.IE) error {
 		case ie.PDRID:
 			v, err := i.PDRID()
 			if err != nil {
-				break
+				return errors.Wrap(err, "UpdatePDR: failed to parse PDRID")
 			}
 			pdrid = uint64(v)
 		case ie.Precedence:
 			v, err := i.Precedence()
 			if err != nil {
+				// Precedence is optional in Update, log but continue
+				logger.FwderLog.Warnf("UpdatePDR: Failed to parse Precedence: %v", err)
 				break
 			}
 			attrs = append(attrs, nl.Attr{
@@ -507,7 +548,7 @@ func (g *Gtp5g) UpdatePDR(lSeid uint64, req *ie.IE) error {
 		case ie.PDI:
 			v, err := g.newPdi(i)
 			if err != nil {
-				break
+				return errors.Wrap(err, "UpdatePDR: failed to parse PDI")
 			}
 			if v != nil {
 				attrs = append(attrs, nl.Attr{
@@ -518,6 +559,7 @@ func (g *Gtp5g) UpdatePDR(lSeid uint64, req *ie.IE) error {
 		case ie.OuterHeaderRemoval:
 			v, err := i.OuterHeaderRemovalDescription()
 			if err != nil {
+				logger.FwderLog.Warnf("UpdatePDR: Failed to parse OuterHeaderRemoval: %v", err)
 				break
 			}
 			attrs = append(attrs, nl.Attr{
@@ -528,6 +570,7 @@ func (g *Gtp5g) UpdatePDR(lSeid uint64, req *ie.IE) error {
 		case ie.FARID:
 			v, err := i.FARID()
 			if err != nil {
+				logger.FwderLog.Warnf("UpdatePDR: Failed to parse FARID: %v", err)
 				break
 			}
 			attrs = append(attrs, nl.Attr{
@@ -537,6 +580,7 @@ func (g *Gtp5g) UpdatePDR(lSeid uint64, req *ie.IE) error {
 		case ie.QERID:
 			v, err := i.QERID()
 			if err != nil {
+				logger.FwderLog.Warnf("UpdatePDR: Failed to parse QERID: %v", err)
 				break
 			}
 			attrs = append(attrs, nl.Attr{
@@ -546,6 +590,7 @@ func (g *Gtp5g) UpdatePDR(lSeid uint64, req *ie.IE) error {
 		case ie.URRID:
 			v, err := i.URRID()
 			if err != nil {
+				logger.FwderLog.Warnf("UpdatePDR: Failed to parse URRID: %v", err)
 				break
 			}
 			attrs = append(attrs, nl.Attr{
