@@ -174,6 +174,11 @@ type Subscription struct {
 	CreatedAt  time.Time
 	LastNotify time.Time
 
+	// WarmStartEndTime records the absolute end time of the last historical
+	// window sent by the pseudo driver. Live traffic StartTime will be clamped
+	// to never go before this value, preventing time regression at the handoff.
+	WarmStartEndTime time.Time
+
 	// Snapshots keeps the last seen per-session counters for delta computation.
 	// Key: SessionKey (LocalSEID, RemoteSEID)
 	// Val: last counters over [StartTime, EndTime]

@@ -231,6 +231,22 @@ func (pd *PseudoDriver) LoadAndReplay(sub *Subscription) {
 		}
 	}
 
+	// Record the absolute end time of the last historical window.
+	// The live Aggregator will clamp StartTime to never go before this,
+	// preventing time regression at the handoff point.
+	if len(windows) > 0 {
+		lastWindow := windows[len(windows)-1]
+		// Find the latest EndTime across all UE measures in the last window
+		for _, m := range lastWindow {
+			if m.EndTime.After(sub.WarmStartEndTime) {
+				sub.WarmStartEndTime = m.EndTime
+			}
+		}
+		pd.logger.Info("pseudo driver: warm-start end time recorded",
+			zap.Time("warmStartEndTime", sub.WarmStartEndTime),
+		)
+	}
+
 	// Update LastNotify to avoid immediate live notification overlap
 	sub.LastNotify = time.Now()
 

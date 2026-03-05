@@ -449,6 +449,19 @@ func (aggregator *Aggregator) PushReport(sessRpt report.SessReport) {
 			continue
 		}
 
+		// Clamp StartTime to never go before warm-start end time.
+		// This prevents time regression at the handoff from historical replay to live traffic.
+		if !sub.WarmStartEndTime.IsZero() && m.StartTime.Before(sub.WarmStartEndTime) {
+			aggregator.logger.Info("ees clamping live StartTime to warm-start end",
+				zap.String("subscriptionId", sub.ID),
+				zap.Time("originalStartTime", m.StartTime),
+				zap.Time("warmStartEndTime", sub.WarmStartEndTime),
+			)
+			m.StartTime = sub.WarmStartEndTime
+			// Recompute throughput with the clamped time range
+			computeThroughputIfPossible(&m)
+		}
+
 		// Accumulate to buffer (will be sent in TickOnce)
 		aggregator.mu.Lock()
 		aggregator.reportBuffer[sub.ID] = append(aggregator.reportBuffer[sub.ID], m)
