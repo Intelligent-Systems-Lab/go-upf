@@ -58,10 +58,11 @@ type Logger struct {
 }
 
 type EESConfig struct {
-	Enabled    bool   `yaml:"enabled"    valid:"optional"`
-	ListenAddr string `yaml:"listenAddr" valid:"optional"` // e.g. "0.0.0.0:8088"
-	PeriodSec  int    `yaml:"periodSec"  valid:"optional"`
-	LogLevel   string `yaml:"logLevel"   valid:"optional"` // reuse global level if empty
+	Enabled     bool   `yaml:"enabled"     valid:"optional"`
+	ListenAddr  string `yaml:"listenAddr"  valid:"optional"` // e.g. "0.0.0.0:8088"
+	PeriodSec   int    `yaml:"periodSec"   valid:"optional"`
+	LogLevel    string `yaml:"logLevel"    valid:"optional"` // reuse global level if empty
+	ParquetDir  string `yaml:"parquetDir"  valid:"optional"` // Directory containing historical traffic Parquet files for warm start
 }
 
 func (c *Config) GetVersion() string {

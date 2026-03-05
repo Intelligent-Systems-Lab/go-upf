@@ -230,7 +230,15 @@ func (u *UpfApp) Run() error {
 		if listenAddr == "" {
 			listenAddr = ":8088"
 		}
-		apiServer := ees.NewServer(subscriptionStore, aggregator, eesLogger)
+		// Create PseudoDriver for warm-start
+		parquetDir := u.cfg.EES.ParquetDir
+		if parquetDir == "" {
+			parquetDir = "pre_data" // default directory relative to go-upf
+		}
+		pseudoDriver := ees.NewPseudoDriver(parquetDir, notifier, eesLogger)
+		logger.MainLog.Infof("EES PseudoDriver enabled with parquet directory: %s", parquetDir)
+
+		apiServer := ees.NewServer(subscriptionStore, aggregator, eesLogger, pseudoDriver)
 
 		go func() {
 			if err := apiServer.Serve(listenAddr); err != nil {

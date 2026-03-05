@@ -29,6 +29,7 @@ type Server struct {
 	subscriptionStore *SubscriptionStore
 	aggregator        *Aggregator
 	logger            *zap.Logger
+	pseudoDriver      *PseudoDriver // optional: for warm-start historical data replay
 }
 
 // NewServer constructs a Server.
@@ -36,11 +37,13 @@ func NewServer(
 	store *SubscriptionStore,
 	aggregator *Aggregator,
 	logger *zap.Logger,
+	pseudoDriver *PseudoDriver,
 ) *Server {
 	return &Server{
 		subscriptionStore: store,
 		aggregator:        aggregator,
 		logger:            logger,
+		pseudoDriver:      pseudoDriver,
 	}
 }
 
@@ -135,6 +138,14 @@ func (server *Server) handleCreateSubscription(w http.ResponseWriter, r *http.Re
 		}
 		http.Error(w, fmt.Sprintf("create subscription failed: %v", err), status)
 		return
+	}
+
+	// Pseudo driver: replay historical data as warm start
+	if server.pseudoDriver != nil {
+		// Retrieve the stored subscription (with ID assigned) for the pseudo driver
+		if storedSub, found := server.subscriptionStore.GetSubscription(subscriptionID); found {
+			go server.pseudoDriver.LoadAndReplay(storedSub)
+		}
 	}
 
 	// On-demand mode: trigger immediate report
