@@ -392,16 +392,17 @@ func (pd *PseudoDriver) aggregateIntoWindows(packets []parsedPacket, periodSec i
 
 			var m UsageMeasures
 			if exists {
-				pktStart := referenceTime.Add(time.Duration(ca.startTime * float64(time.Second)))
-				pktEnd := referenceTime.Add(time.Duration(ca.endTime * float64(time.Second)))
+				// Align StartTime/EndTime to fixed window boundaries so that
+				// all UEs in the same notification share identical time ranges,
+				// matching the live UPF-EES behavior.
 				m = UsageMeasures{
 					Key:            SessionKey{LocalSEID: uint64(wIdx + 1)}, // pseudo SEID
 					ULBytesDelta:   ca.ulBytes,
 					DLBytesDelta:   ca.dlBytes,
 					ULPacketsDelta: ca.ulPkts,
 					DLPacketsDelta: ca.dlPkts,
-					StartTime:      pktStart,
-					EndTime:        pktEnd,
+					StartTime:      defaultStartT,
+					EndTime:        defaultEndT,
 					UeIpv4Addr:     ueIP,
 				}
 			} else {
