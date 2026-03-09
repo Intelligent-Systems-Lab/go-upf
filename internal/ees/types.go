@@ -179,6 +179,12 @@ type Subscription struct {
 	// to never go before this value, preventing time regression at the handoff.
 	WarmStartEndTime time.Time
 
+	// LiveTimeOffset records the time drift between the kernel's URR StartTime
+	// and the UPF's time.Now() at the moment the first URR is received.
+	// This offset is subtracted from all subsequent live traffic timestamps
+	// to ensure a perfectly contiguous timeline following the historical replay.
+	LiveTimeOffset time.Duration
+
 	// Snapshots keeps the last seen per-session counters for delta computation.
 	// Key: SessionKey (LocalSEID, RemoteSEID)
 	// Val: last counters over [StartTime, EndTime]

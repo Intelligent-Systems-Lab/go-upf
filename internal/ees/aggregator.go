@@ -43,6 +43,7 @@ type Aggregator struct {
 
 	sessionProvider SessionProvider      // Added: to lookup UE IP
 	perioServer     PerioServerInterface // Added: to query URR periods
+	pseudoDriver    *PseudoDriver        // Signal pseudo driver on first URR
 
 	// Dynamic period adjustment
 	ticker         *time.Ticker
@@ -66,6 +67,7 @@ func NewAggregator(
 	logger *zap.Logger,
 	sessionProvider SessionProvider,
 	perioServer PerioServerInterface,
+	pseudoDriver *PseudoDriver,
 ) *Aggregator {
 	return &Aggregator{
 		subscriptionStore: subscriptionStore,
@@ -74,6 +76,7 @@ func NewAggregator(
 		logger:            logger,
 		sessionProvider:   sessionProvider,
 		perioServer:       perioServer,
+		pseudoDriver:      pseudoDriver,
 
 		// Initialize report buffer for Push mode
 		reportBuffer: make(map[string][]UsageMeasures),
@@ -442,6 +445,14 @@ func (aggregator *Aggregator) PushReport(sessRpt report.SessReport) {
 	}
 	computeThroughputIfPossible(&m)
 
+	// Anchoring: Signal the PseudoDriver that the first real URR has arrived.
+	// We use time.Now() (the moment we receive the URR) as the anchor point,
+	// rather than the URR's StartTime, so that the live traffic StartTime
+	// gets clamped to the actual time of reception (e.g., 15:33:41).
+	if aggregator.pseudoDriver != nil {
+		aggregator.pseudoDriver.SignalFirstURR(time.Now())
+	}
+
 	// Match to subscriptions by target scope
 	subscriptions := aggregator.subscriptionStore.AllSubscriptions()
 	for _, sub := range subscriptions {
@@ -449,23 +460,44 @@ func (aggregator *Aggregator) PushReport(sessRpt report.SessReport) {
 			continue
 		}
 
-		// Clamp StartTime to never go before warm-start end time.
-		// This prevents time regression at the handoff from historical replay to live traffic.
-		if !sub.WarmStartEndTime.IsZero() && m.StartTime.Before(sub.WarmStartEndTime) {
-			aggregator.logger.Info("ees clamping live StartTime to warm-start end",
-				zap.String("subscriptionId", sub.ID),
-				zap.Time("originalStartTime", m.StartTime),
-				zap.Time("warmStartEndTime", sub.WarmStartEndTime),
-			)
-			m.StartTime = sub.WarmStartEndTime
-			// Recompute throughput with the clamped time range
-			computeThroughputIfPossible(&m)
-		}
+		// Align the live traffic timeline perfectly with the historical end time.
+		if !sub.WarmStartEndTime.IsZero() {
+			// On the first live report, calculate the constant offset between
+			// the kernel's URR StartTime and the WarmStartEndTime (the Anchor).
+			if sub.LiveTimeOffset == 0 {
+				sub.LiveTimeOffset = m.StartTime.Sub(sub.WarmStartEndTime)
+				aggregator.logger.Info("ees established live timeline offset",
+					zap.String("subscriptionId", sub.ID),
+					zap.Duration("liveTimeOffset", sub.LiveTimeOffset),
+					zap.Time("originalStartTime", m.StartTime),
+					zap.Time("warmStartEndTime", sub.WarmStartEndTime),
+				)
+			}
 
-		// Accumulate to buffer (will be sent in TickOnce)
-		aggregator.mu.Lock()
-		aggregator.reportBuffer[sub.ID] = append(aggregator.reportBuffer[sub.ID], m)
-		aggregator.mu.Unlock()
+			// Apply the offset continuously to all subsequent live traffic.
+			// This perfectly stitches the live timeline exactly where the historical
+			// timeline ended, with zero time regression or gaps.
+			adjustedStartTime := m.StartTime.Add(-sub.LiveTimeOffset)
+			adjustedEndTime := m.EndTime.Add(-sub.LiveTimeOffset)
+
+			// Update the measure (creating a copy for this specific subscription)
+			mCopy := m
+			mCopy.StartTime = adjustedStartTime
+			mCopy.EndTime = adjustedEndTime
+
+			// Recompute throughput with the shifted time range
+			computeThroughputIfPossible(&mCopy)
+
+			// Accumulate to buffer (will be sent in TickOnce)
+			aggregator.mu.Lock()
+			aggregator.reportBuffer[sub.ID] = append(aggregator.reportBuffer[sub.ID], mCopy)
+			aggregator.mu.Unlock()
+		} else {
+			// No historical replay, append as-is
+			aggregator.mu.Lock()
+			aggregator.reportBuffer[sub.ID] = append(aggregator.reportBuffer[sub.ID], m)
+			aggregator.mu.Unlock()
+		}
 
 		aggregator.logger.Info("ees smf urr report captured",
 			zap.String("subscriptionId", sub.ID),

@@ -16,6 +16,7 @@ import (
 	"math"
 	"os"
 	"sort"
+	"sync"
 	"time"
 
 	"github.com/parquet-go/parquet-go"
@@ -28,15 +29,37 @@ type PseudoDriver struct {
 	parquetDir string
 	notifier   *Notifier
 	logger     *zap.Logger
+
+	// FirstURRSignal is signaled by the Aggregator when the first URR report arrives.
+	// The pseudo driver waits on this channel to anchor its timeline to the real
+	// URR StartTime, ensuring perfect time window alignment between historical and live data.
+	FirstURRSignal chan time.Time
+	firstURROnce   sync.Once // ensures the signal is sent only once
 }
 
 // NewPseudoDriver constructs a PseudoDriver.
 func NewPseudoDriver(parquetDir string, notifier *Notifier, logger *zap.Logger) *PseudoDriver {
 	return &PseudoDriver{
-		parquetDir: parquetDir,
-		notifier:   notifier,
-		logger:     logger,
+		parquetDir:     parquetDir,
+		notifier:       notifier,
+		logger:         logger,
+		FirstURRSignal: make(chan time.Time, 1),
 	}
+}
+
+// SignalFirstURR is called by the Aggregator when the first URR report arrives.
+// It sends the URR's StartTime to the pseudo driver so it can anchor its timeline.
+// This is safe to call multiple times; only the first call has effect.
+func (pd *PseudoDriver) SignalFirstURR(urrStartTime time.Time) {
+	if pd == nil {
+		return
+	}
+	pd.firstURROnce.Do(func() {
+		pd.FirstURRSignal <- urrStartTime
+		pd.logger.Info("pseudo driver: first URR signal sent",
+			zap.Time("urrStartTime", urrStartTime),
+		)
+	})
 }
 
 // ParquetRow represents a single row from the historical traffic Parquet file.
@@ -144,14 +167,48 @@ func (pd *PseudoDriver) LoadAndReplay(sub *Subscription) {
 		totalDurationSec += (maxTS - minTS) + 0.001
 	}
 
-	// Rewind the absolute reference time by the total historical duration.
-	// This makes the historical timeline end EXACTLY at time.Now()
-	// and prevents StartTime/EndTime overlap with upcoming real-time live traffic.
-	referenceTime := time.Now().Add(-time.Duration(totalDurationSec * float64(time.Second)))
+	// Wait for the first URR report from the kernel to anchor the timeline.
+	// This ensures that the historical replay's EndTime aligns perfectly with
+	// the live traffic's first StartTime, preventing gaps or misalignment.
+	const urrWaitTimeout = 60 * time.Second
+	pd.logger.Info("pseudo driver: waiting for first URR signal to anchor timeline",
+		zap.Duration("timeout", urrWaitTimeout),
+	)
+
+	var anchorTime time.Time
+	select {
+	case urrStartTime := <-pd.FirstURRSignal:
+		anchorTime = urrStartTime
+		pd.logger.Info("pseudo driver: anchored to first URR StartTime",
+			zap.Time("urrStartTime", urrStartTime),
+		)
+	case <-time.After(urrWaitTimeout):
+		anchorTime = time.Now()
+		pd.logger.Warn("pseudo driver: URR wait timed out, falling back to time.Now()",
+			zap.Duration("timeout", urrWaitTimeout),
+		)
+	}
+
+	// Calculate the exact window-aligned duration to rewind.
+	// The max timestamp is roughly totalDurationSec - 0.001.
+	// We bucket this into windows of size periodSec.
+	maxTimestamp := totalDurationSec - 0.001
+	if maxTimestamp < 0 {
+		maxTimestamp = 0
+	}
+	maxWindowIndex := math.Floor(maxTimestamp / float64(periodSec))
+	alignedDurationSec := (maxWindowIndex + 1) * float64(periodSec)
+
+	// Rewind the anchor time by the ALIGNED historical duration.
+	// This makes the historical timeline's last window end EXACTLY at the
+	// first URR StartTime, ensuring perfect time window alignment without overlap.
+	referenceTime := anchorTime.Add(-time.Duration(alignedDurationSec * float64(time.Second)))
 	globalTimeOffset := 0.0
 
-	pd.logger.Info("pseudo driver: started warm-start sequence with timestamp rewind",
+	pd.logger.Info("pseudo driver: started warm-start sequence with URR-anchored timeline",
+		zap.Time("anchorTime", anchorTime),
 		zap.Float64("totalDurationSec", totalDurationSec),
+		zap.Float64("alignedDurationSec", alignedDurationSec),
 		zap.Time("shiftedReferenceTime", referenceTime),
 	)
 

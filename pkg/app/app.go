@@ -195,13 +195,22 @@ func (u *UpfApp) Run() error {
 			perioServer = gtp5gDriver.GetPerioServer()
 		}
 
+		// Create PseudoDriver for warm-start FIRST so it can be passed to Aggregator
+		parquetDir := u.cfg.EES.ParquetDir
+		if parquetDir == "" {
+			parquetDir = "pre_data" // default directory relative to go-upf
+		}
+		pseudoDriver := ees.NewPseudoDriver(parquetDir, notifier, eesLogger)
+		logger.MainLog.Infof("EES PseudoDriver enabled with parquet directory: %s", parquetDir)
+
 		aggregator := ees.NewAggregator(
 			subscriptionStore,
 			time.Duration(period)*time.Second,
 			notifier,
 			eesLogger,
 			sessionProvider,
-			perioServer, // Pass perioServer for period validation
+			perioServer,  // Pass perioServer for period validation
+			pseudoDriver, // Pass pseudoDriver to receive URR signals
 		)
 
 		// 3. Register EES Handler to Dispatcher
@@ -230,13 +239,6 @@ func (u *UpfApp) Run() error {
 		if listenAddr == "" {
 			listenAddr = ":8088"
 		}
-		// Create PseudoDriver for warm-start
-		parquetDir := u.cfg.EES.ParquetDir
-		if parquetDir == "" {
-			parquetDir = "pre_data" // default directory relative to go-upf
-		}
-		pseudoDriver := ees.NewPseudoDriver(parquetDir, notifier, eesLogger)
-		logger.MainLog.Infof("EES PseudoDriver enabled with parquet directory: %s", parquetDir)
 
 		apiServer := ees.NewServer(subscriptionStore, aggregator, eesLogger, pseudoDriver)
 
