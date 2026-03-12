@@ -15,6 +15,8 @@ package ees
 
 import (
 	"context"
+	"fmt"
+	"sort"
 	"sync"
 	"time"
 
@@ -51,6 +53,11 @@ type Aggregator struct {
 	tickerReset    chan struct{} // Signal to reset ticker when period changes
 	periodAdjusted bool          // Marks if period has been adjusted once
 
+	// Shared ticker synchronization: Phase 2 waits on tickDone after each TickOnce
+	tickDone     chan struct{} // Signal Phase 2 after TickOnce completes
+	lastTickTime time.Time     // Wall-clock time of most recent TickOnce
+	lastTickMu   sync.RWMutex
+
 	// [Legacy] State cache: kept for delta computation if needed
 	// Key: SessionKey, Value: Last Counters
 	lastSnapshot map[SessionKey]Counters
@@ -83,6 +90,9 @@ func NewAggregator(
 
 		// Initialize ticker reset channel
 		tickerReset: make(chan struct{}, 1),
+
+		// Initialize shared ticker synchronization channel
+		tickDone: make(chan struct{}, 1),
 
 		// Initialize legacy snapshot maps (kept for potential future use)
 		lastSnapshot:     make(map[SessionKey]Counters),
@@ -130,8 +140,40 @@ func (aggregator *Aggregator) Run(parentContext context.Context) {
 				aggregator.logger.Info("ees ticker reset signal received, recreating ticker")
 				break tickerLoop
 			case <-tickerC:
+				// Wait briefly to allow 'perio' ticker (which fires simultaneously)
+				// to fetch Kernel reports and push them into our buffer.
+				// This ensures Phase 2 and Kernel data for the SAME window are
+				// processed and sent in the SAME Notification, rather than Kernel
+				// lagging behind by one tick.
+				time.Sleep(100 * time.Millisecond)
+
+				// Record tick time BEFORE processing
+				// CRITICAL FIX: time.Now() has millisecond/microsecond jitter (e.g. .663Z).
+				// We MUST snap this to a perfect multiple of currentPeriod (e.g. .000Z)
+				// so the Phase 2 simulation grid doesn't inherit a random sub-second offset,
+				// which causes math.Round() in snapTime() to sometimes round up and sometimes round down
+				// for the exact same conceptual window.
+				aggregator.lastTickMu.Lock()
+				nowRaw := time.Now()
+				if aggregator.lastTickTime.IsZero() {
+					// First tick: completely strip the sub-second fraction to establish a perfect grid
+					aggregator.lastTickTime = nowRaw.Truncate(time.Second)
+				} else {
+					// Subsequent ticks: rigidly advance by exactly one period.
+					// This completely ignores Ticker jitter and OS scheduling delays,
+					// ensuring the grid remains perfectly mathematically aligned forever.
+					aggregator.lastTickTime = aggregator.lastTickTime.Add(currentPeriod)
+				}
+				aggregator.lastTickMu.Unlock()
+
 				if _, err := aggregator.TickOnce(parentContext); err != nil {
 					aggregator.logger.Warn("ees aggregator tick failed", zap.Error(err))
+				}
+
+				// Signal Phase 2 that this tick cycle is done
+				select {
+				case aggregator.tickDone <- struct{}{}:
+				default:
 				}
 			}
 		}
@@ -143,6 +185,20 @@ func (aggregator *Aggregator) getTicker() *time.Ticker {
 	aggregator.tickerMu.Lock()
 	defer aggregator.tickerMu.Unlock()
 	return aggregator.ticker
+}
+
+// WaitForTick blocks until the next TickOnce completes.
+// Used by Phase 2 to synchronize with Aggregator's heartbeat.
+func (aggregator *Aggregator) WaitForTick() {
+	<-aggregator.tickDone
+}
+
+// GetLastTickTime returns the wall-clock time of the most recent TickOnce trigger.
+// Used by PseudoDriver to anchor the time grid to the Aggregator's heartbeat.
+func (aggregator *Aggregator) GetLastTickTime() time.Time {
+	aggregator.lastTickMu.RLock()
+	defer aggregator.lastTickMu.RUnlock()
+	return aggregator.lastTickTime
 }
 
 // TickOnce sends notifications using accumulated reports from the Push buffer.
@@ -237,8 +293,33 @@ func (aggregator *Aggregator) TickOnce(ctx context.Context) (int, error) {
 			)
 		}
 
-		// Consolidate reports: merge multiple reports for the same session
+		periodDuration := time.Duration(subscription.PeriodSec) * time.Second
+
+		// 1. Time Window Snapping (Before Consolidation)
+		// Snap the END TIME to the grid, then calculate StartTime.
+		// Why EndTime? Because Kernel reports define StartTime as the arrival of the FIRST packet
+		// in the measurement period, which could be anywhere (e.g., .1, .9).
+		// By snapping the EndTime (when the report is generated, e.g., slightly after the period ends),
+		// we correctly attribute the Kernel report to the exact Phase 2 window it belongs to.
+		for i := range usageMeasuresList {
+			if !subscription.GridAnchor.IsZero() {
+				snappedEnd := snapTime(usageMeasuresList[i].EndTime, subscription.GridAnchor, periodDuration)
+				usageMeasuresList[i].EndTime = snappedEnd
+				usageMeasuresList[i].StartTime = snappedEnd.Add(-periodDuration)
+			} else {
+				snappedEnd := usageMeasuresList[i].EndTime.Round(periodDuration)
+				usageMeasuresList[i].EndTime = snappedEnd
+				usageMeasuresList[i].StartTime = snappedEnd.Add(-periodDuration)
+			}
+		}
+
+		// 2. Consolidate reports: group by (IP + SnappedStartTime)
 		consolidatedList := consolidateReports(usageMeasuresList)
+
+		// 3. Compute throughput for the final consolidated list
+		for i := range consolidatedList {
+			computeThroughputIfPossible(&consolidatedList[i])
+		}
 
 		aggregator.logger.Info("ees consolidation result",
 			zap.String("subscriptionId", subscription.ID),
@@ -302,34 +383,77 @@ func (aggregator *Aggregator) TickOnce(ctx context.Context) (int, error) {
 	return totalNotifications, nil
 }
 
-// consolidateReports merges multiple UsageMeasures for the same session into one.
-// For each unique SessionKey, it produces a single consolidated report.
-// For Periodic triggers (URR 1/2), each report is an INCREMENTAL value for that period,
-// so we MUST SUM them to get the total usage across multiple periods.
-// StartTime is set to the earliest StartTime seen in the batch.
-// EndTime is set to the latest EndTime seen in the batch.
+func snapTime(t time.Time, anchor time.Time, period time.Duration) time.Time {
+	offset := t.Sub(anchor)
+	// Round offset to the nearest multiple of period using pure integer math
+	// to avoid float64 precision errors that can cause 1-nanosecond differences.
+	halfPeriod := period / 2
+	var roundedOffset time.Duration
+	if offset >= 0 {
+		roundedOffset = ((offset + halfPeriod) / period) * period
+	} else {
+		roundedOffset = ((offset - halfPeriod) / period) * period
+	}
+
+	// Truncate to millisecond to definitively wipe out any stray nanosecond noise
+	return anchor.Add(roundedOffset).Truncate(time.Millisecond)
+}
+
+func (aggregator *Aggregator) PushHistoricalMeasures(sub *Subscription, measures []UsageMeasures, logicalTime time.Time) {
+	if len(measures) == 0 {
+		return
+	}
+	// For historical data, we bypass the reportBuffer and send immediately
+	if err := aggregator.notifier.Notify(sub, measures); err != nil {
+		aggregator.logger.Warn("ees notify (historical) failed", zap.Error(err))
+	} else {
+		aggregator.logger.Debug("ees notify (historical) success", zap.Time("logicalTime", logicalTime))
+	}
+	// Anchor the last notify time so live traffic aligns its next tick correctly
+	sub.LastNotify = logicalTime
+}
+
+func (aggregator *Aggregator) PushLiveMeasures(sub *Subscription, measures []UsageMeasures) {
+	if len(measures) == 0 {
+		return
+	}
+	aggregator.mu.Lock()
+	defer aggregator.mu.Unlock()
+	aggregator.reportBuffer[sub.ID] = append(aggregator.reportBuffer[sub.ID], measures...)
+}
+
+// consolidateReports merges multiple UsageMeasures by grouping them by BOTH IP and StartTime.
+// Since StartTime is already snapped to the grid before this is called,
+// Kernel and Phase 2 reports for the SAME window will merge perfectly,
+// while reports for DIFFERENT windows will remain separate.
 func consolidateReports(reports []UsageMeasures) []UsageMeasures {
 	if len(reports) <= 1 {
 		return reports
 	}
 
-	// Map by SessionKey for consolidation
-	consolidated := make(map[SessionKey]*UsageMeasures)
+	// Map by (UE IP + StartTime)
+	consolidated := make(map[string]*UsageMeasures)
 
 	for _, r := range reports {
-		existing, ok := consolidated[r.Key]
+		key := r.UeIpv4Addr
+		if key == "" {
+			// Fallback if IP is missing
+			key = fmt.Sprintf("seid-%d-%d", r.Key.LocalSEID, r.Key.RemoteSEID)
+		}
+
+		// Group by both IP and snapped StartTime
+		timeKey := fmt.Sprintf("%s-%d", key, r.StartTime.UnixNano())
+
+		existing, ok := consolidated[timeKey]
 		if !ok {
 			// First occurrence - create a copy
 			rCopy := r
-			consolidated[r.Key] = &rCopy
+			consolidated[timeKey] = &rCopy
 			continue
 		}
 
 		// Update logic for Periodic Incremental Reports:
-		// Each report represents usage in a specific time period (e.g., 5 seconds).
-		// We need to SUM all reports to get total usage across multiple periods.
-
-		// 1. Maintain the widest time window
+		// 1. Maintain the widest time window for correctness
 		if r.StartTime.Before(existing.StartTime) {
 			existing.StartTime = r.StartTime
 		}
@@ -337,21 +461,23 @@ func consolidateReports(reports []UsageMeasures) []UsageMeasures {
 			existing.EndTime = r.EndTime
 		}
 
-		// 2. Sum Volume/Packet counters (not max!)
-		// Periodic triggers provide incremental values that must be summed.
-		// Example: Report1(0-5s)=1000 bytes + Report2(5-10s)=800 bytes = 1800 bytes total
+		// 2. Sum Volume/Packet counters
 		existing.ULBytesDelta += r.ULBytesDelta
 		existing.DLBytesDelta += r.DLBytesDelta
 		existing.ULPacketsDelta += r.ULPacketsDelta
 		existing.DLPacketsDelta += r.DLPacketsDelta
 	}
 
-	// Convert map back to slice and recompute throughput
+	// Convert map back to slice
 	result := make([]UsageMeasures, 0, len(consolidated))
 	for _, m := range consolidated {
-		computeThroughputIfPossible(m)
 		result = append(result, *m)
 	}
+
+	// Sort results by StartTime ascending so notifications emerge in causal order
+	sort.SliceStable(result, func(i, j int) bool {
+		return result[i].StartTime.Before(result[j].StartTime)
+	})
 
 	return result
 }
@@ -360,6 +486,10 @@ func consolidateReports(reports []UsageMeasures) []UsageMeasures {
 // Reports are accumulated in reportBuffer and sent during the next TickOnce().
 // New logic: Aggregate all SMF URRs per session (no Shadow URR filtering).
 func (aggregator *Aggregator) PushReport(sessRpt report.SessReport) {
+	// Note: With the shared ticker architecture, Phase 2 and TickOnce are perfectly
+	// synchronized. Kernel reports flow naturally into the buffer and are merged
+	// with Phase 2 data by consolidateReports (keyed by IP + SnappedStartTime).
+
 	// Debug: Log all incoming reports
 	aggregator.logger.Info("PushReport called",
 		zap.Uint64("seid", sessRpt.SEID),
@@ -446,11 +576,9 @@ func (aggregator *Aggregator) PushReport(sessRpt report.SessReport) {
 	computeThroughputIfPossible(&m)
 
 	// Anchoring: Signal the PseudoDriver that the first real URR has arrived.
-	// We use time.Now() (the moment we receive the URR) as the anchor point,
-	// rather than the URR's StartTime, so that the live traffic StartTime
-	// gets clamped to the actual time of reception (e.g., 15:33:41).
+	// We use m.EndTime (which is basically Now) to align history seamlessly to the present.
 	if aggregator.pseudoDriver != nil {
-		aggregator.pseudoDriver.SignalFirstURR(time.Now())
+		aggregator.pseudoDriver.SignalFirstURR(m.EndTime)
 	}
 
 	// Match to subscriptions by target scope
@@ -460,44 +588,39 @@ func (aggregator *Aggregator) PushReport(sessRpt report.SessReport) {
 			continue
 		}
 
-		// Align the live traffic timeline perfectly with the historical end time.
-		if !sub.WarmStartEndTime.IsZero() {
-			// On the first live report, calculate the constant offset between
-			// the kernel's URR StartTime and the WarmStartEndTime (the Anchor).
-			if sub.LiveTimeOffset == 0 {
-				sub.LiveTimeOffset = m.StartTime.Sub(sub.WarmStartEndTime)
-				aggregator.logger.Info("ees established live timeline offset",
+		if sub.GridAnchor.IsZero() {
+			// Only set GridAnchor from Kernel if PseudoDriver has NOT set it.
+			// When PseudoDriver is active, IT is the single source of truth for the grid.
+			if aggregator.pseudoDriver == nil {
+				sub.GridAnchor = m.EndTime
+				aggregator.logger.Info("ees established grid anchor (vanilla mode)",
 					zap.String("subscriptionId", sub.ID),
-					zap.Duration("liveTimeOffset", sub.LiveTimeOffset),
-					zap.Time("originalStartTime", m.StartTime),
-					zap.Time("warmStartEndTime", sub.WarmStartEndTime),
+					zap.Time("gridAnchor", sub.GridAnchor),
+				)
+			} else {
+				aggregator.logger.Debug("ees skipping grid anchor set - PseudoDriver will set it",
+					zap.String("subscriptionId", sub.ID),
 				)
 			}
-
-			// Apply the offset continuously to all subsequent live traffic.
-			// This perfectly stitches the live timeline exactly where the historical
-			// timeline ended, with zero time regression or gaps.
-			adjustedStartTime := m.StartTime.Add(-sub.LiveTimeOffset)
-			adjustedEndTime := m.EndTime.Add(-sub.LiveTimeOffset)
-
-			// Update the measure (creating a copy for this specific subscription)
-			mCopy := m
-			mCopy.StartTime = adjustedStartTime
-			mCopy.EndTime = adjustedEndTime
-
-			// Recompute throughput with the shifted time range
-			computeThroughputIfPossible(&mCopy)
-
-			// Accumulate to buffer (will be sent in TickOnce)
-			aggregator.mu.Lock()
-			aggregator.reportBuffer[sub.ID] = append(aggregator.reportBuffer[sub.ID], mCopy)
-			aggregator.mu.Unlock()
-		} else {
-			// No historical replay, append as-is
-			aggregator.mu.Lock()
-			aggregator.reportBuffer[sub.ID] = append(aggregator.reportBuffer[sub.ID], m)
-			aggregator.mu.Unlock()
 		}
+
+		// Prevent double-counting historical traffic already simulated by Phase 1 Parquet replay.
+		// If the kernel report StartTime is significantly before our anchor (e.g. established PDU session),
+		// we skip appending it to the buffer so it won't distort the live monitoring start-time and volume.
+		if m.StartTime.Before(sub.GridAnchor.Add(-2 * time.Second)) {
+			aggregator.logger.Info("ees dropping huge historical kernel burst to align with simulation",
+				zap.String("subscriptionId", sub.ID),
+				zap.Time("startTime", m.StartTime),
+				zap.Time("anchorTime", sub.GridAnchor),
+				zap.Uint64("volume", m.ULBytesDelta+m.DLBytesDelta),
+			)
+			continue
+		}
+
+		// Buffer everything directly; TickOnce will snap it
+		aggregator.mu.Lock()
+		aggregator.reportBuffer[sub.ID] = append(aggregator.reportBuffer[sub.ID], m)
+		aggregator.mu.Unlock()
 
 		aggregator.logger.Info("ees smf urr report captured",
 			zap.String("subscriptionId", sub.ID),

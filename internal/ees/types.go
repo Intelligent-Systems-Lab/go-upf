@@ -174,16 +174,9 @@ type Subscription struct {
 	CreatedAt  time.Time
 	LastNotify time.Time
 
-	// WarmStartEndTime records the absolute end time of the last historical
-	// window sent by the pseudo driver. Live traffic StartTime will be clamped
-	// to never go before this value, preventing time regression at the handoff.
-	WarmStartEndTime time.Time
-
-	// LiveTimeOffset records the time drift between the kernel's URR StartTime
-	// and the UPF's time.Now() at the moment the first URR is received.
-	// This offset is subtracted from all subsequent live traffic timestamps
-	// to ensure a perfectly contiguous timeline following the historical replay.
-	LiveTimeOffset time.Duration
+	// GridAnchor records the first URR StartTime to align all future time windows (Time Window Snapping)
+	// ensuring all notifications strictly adhere to N * PeriodSec boundaries.
+	GridAnchor time.Time
 
 	// Snapshots keeps the last seen per-session counters for delta computation.
 	// Key: SessionKey (LocalSEID, RemoteSEID)

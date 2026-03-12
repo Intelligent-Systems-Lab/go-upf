@@ -12,6 +12,7 @@
 package ees
 
 import (
+	"encoding/json"
 	"fmt"
 	"math"
 	"os"
@@ -30,11 +31,18 @@ type PseudoDriver struct {
 	notifier   *Notifier
 	logger     *zap.Logger
 
+	aggregator *Aggregator
+
 	// FirstURRSignal is signaled by the Aggregator when the first URR report arrives.
-	// The pseudo driver waits on this channel to anchor its timeline to the real
-	// URR StartTime, ensuring perfect time window alignment between historical and live data.
 	FirstURRSignal chan time.Time
-	firstURROnce   sync.Once // ensures the signal is sent only once
+	firstURROnce   sync.Once
+
+	// Phase 2 state: tracks the current simulation window so that
+	// Kernel reports can be aligned to the same time grid.
+	isSimulating    bool
+	phase2StartTime time.Time
+	phase2EndTime   time.Time
+	simMu           sync.RWMutex
 }
 
 // NewPseudoDriver constructs a PseudoDriver.
@@ -45,6 +53,13 @@ func NewPseudoDriver(parquetDir string, notifier *Notifier, logger *zap.Logger) 
 		logger:         logger,
 		FirstURRSignal: make(chan time.Time, 1),
 	}
+}
+
+// SetAggregator injects the Aggregator reference.
+func (pd *PseudoDriver) SetAggregator(agg interface{}) {
+	// We use interface{} to avoid circular dependency if they are in different packages,
+	// but they are both in `ees` package, so we can use *Aggregator directly.
+	pd.aggregator = agg.(*Aggregator)
 }
 
 // SignalFirstURR is called by the Aggregator when the first URR report arrives.
@@ -60,6 +75,18 @@ func (pd *PseudoDriver) SignalFirstURR(urrStartTime time.Time) {
 			zap.Time("urrStartTime", urrStartTime),
 		)
 	})
+}
+
+// GetPhase2Window returns the current Phase 2 window's start/end times.
+// If Phase 2 is not active, the bool return is false.
+// Used by PushReport to align Kernel reports to Phase 2's logical timeline.
+func (pd *PseudoDriver) GetPhase2Window() (startTime, endTime time.Time, active bool) {
+	if pd == nil {
+		return time.Time{}, time.Time{}, false
+	}
+	pd.simMu.RLock()
+	defer pd.simMu.RUnlock()
+	return pd.phase2StartTime, pd.phase2EndTime, pd.isSimulating
 }
 
 // ParquetRow represents a single row from the historical traffic Parquet file.
@@ -108,6 +135,24 @@ func (pd *PseudoDriver) LoadAndReplay(sub *Subscription) {
 		zap.Int("periodSec", sub.PeriodSec),
 	)
 
+	// Read file.json for breaking time
+	metaPath := pd.parquetDir + "/file.json"
+	metaBytes, err := os.ReadFile(metaPath)
+	breakingTimeSec := 0.0
+	if err == nil {
+		var meta struct {
+			BreakingTime float64 `json:"breaking time"`
+		}
+		if err := json.Unmarshal(metaBytes, &meta); err == nil {
+			breakingTimeSec = meta.BreakingTime
+		}
+	}
+	if breakingTimeSec <= 0 {
+		breakingTimeSec = 300 // default
+	}
+
+	pd.logger.Info("pseudo driver: using breaking time", zap.Float64("breakingTimeSec", breakingTimeSec))
+
 	// 1. Scan directory for Parquet files
 	entries, err := os.ReadDir(pd.parquetDir)
 	if err != nil {
@@ -133,7 +178,6 @@ func (pd *PseudoDriver) LoadAndReplay(sub *Subscription) {
 		return
 	}
 
-	// Ensure chronological order (run001 -> run015)
 	sort.Strings(files)
 
 	periodSec := sub.PeriodSec
@@ -167,20 +211,24 @@ func (pd *PseudoDriver) LoadAndReplay(sub *Subscription) {
 		totalDurationSec += (maxTS - minTS) + 0.001
 	}
 
-	// Wait for the first URR report from the kernel to anchor the timeline.
-	// This ensures that the historical replay's EndTime aligns perfectly with
-	// the live traffic's first StartTime, preventing gaps or misalignment.
+	// Wait for the first URR report from the kernel, then anchor to the
+	// NEXT TickOnce trigger time. This aligns the entire time grid to the
+	// Aggregator's heartbeat, eliminating sub-second drift.
+	var anchorTime time.Time
 	const urrWaitTimeout = 60 * time.Second
 	pd.logger.Info("pseudo driver: waiting for first URR signal to anchor timeline",
 		zap.Duration("timeout", urrWaitTimeout),
 	)
 
-	var anchorTime time.Time
 	select {
-	case urrStartTime := <-pd.FirstURRSignal:
-		anchorTime = urrStartTime
-		pd.logger.Info("pseudo driver: anchored to first URR StartTime",
-			zap.Time("urrStartTime", urrStartTime),
+	case <-pd.FirstURRSignal:
+		pd.logger.Info("pseudo driver: first URR received, waiting for next TickOnce to anchor")
+		// Wait for the next TickOnce to complete, then use its trigger time.
+		// This guarantees anchorTime falls exactly on the Aggregator's tick boundary.
+		pd.aggregator.WaitForTick()
+		anchorTime = pd.aggregator.GetLastTickTime()
+		pd.logger.Info("pseudo driver: anchored to TickOnce trigger time",
+			zap.Time("anchorTime", anchorTime),
 		)
 	case <-time.After(urrWaitTimeout):
 		anchorTime = time.Now()
@@ -188,68 +236,41 @@ func (pd *PseudoDriver) LoadAndReplay(sub *Subscription) {
 			zap.Duration("timeout", urrWaitTimeout),
 		)
 	}
+	// anchorTime is now precisely aligned to the Aggregator's tick boundary.
+	// No sub-second fraction — the entire grid shares the Aggregator's heartbeat.
 
-	// Calculate the exact window-aligned duration to rewind.
-	// The max timestamp is roughly totalDurationSec - 0.001.
-	// We bucket this into windows of size periodSec.
-	maxTimestamp := totalDurationSec - 0.001
-	if maxTimestamp < 0 {
-		maxTimestamp = 0
-	}
-	maxWindowIndex := math.Floor(maxTimestamp / float64(periodSec))
-	alignedDurationSec := (maxWindowIndex + 1) * float64(periodSec)
-
-	// Rewind the anchor time by the ALIGNED historical duration.
-	// This makes the historical timeline's last window end EXACTLY at the
-	// first URR StartTime, ensuring perfect time window alignment without overlap.
-	referenceTime := anchorTime.Add(-time.Duration(alignedDurationSec * float64(time.Second)))
+	// Absolute reference time for Parquet offset 0
+	// breakingTimeSec corresponds to the Anchor.
+	// So 0 corresponds to Anchor - breakingTimeSec
+	referenceTime := anchorTime.Add(-time.Duration(breakingTimeSec * float64(time.Second)))
 	globalTimeOffset := 0.0
 
-	pd.logger.Info("pseudo driver: started warm-start sequence with URR-anchored timeline",
+	// CRITICAL: Set the subscription's GridAnchor to our referenceTime.
+	// This is the SINGLE SOURCE OF TRUTH for the entire time grid.
+	// Both Phase 1/2 windows AND the Aggregator's snapTime() will use this same anchor,
+	// guaranteeing zero drift between historical replay and live Kernel reports.
+	sub.GridAnchor = referenceTime
+	pd.logger.Info("pseudo driver: set GridAnchor on subscription",
+		zap.Time("gridAnchor", referenceTime),
 		zap.Time("anchorTime", anchorTime),
-		zap.Float64("totalDurationSec", totalDurationSec),
-		zap.Float64("alignedDurationSec", alignedDurationSec),
-		zap.Time("shiftedReferenceTime", referenceTime),
 	)
 
-	totalSentCount := 0
-	totalPacketsMatched := 0
+	var phase1Packets []parsedPacket
+	var phase2Packets []parsedPacket
 
-	// We will collect all filtered packets across all files into one large slice
-	// to ensure that aggregation time windows don't get split across file boundaries.
-	var allHistoricalPackets []parsedPacket
-
-	for fileIdx, fileObj := range files {
-		pd.logger.Info("pseudo driver: loading parquet chunk",
-			zap.String("subscriptionId", sub.ID),
-			zap.String("file", fileObj),
-			zap.Int("fileIdx", fileIdx+1),
-			zap.Int("totalFiles", len(files)),
-		)
-
-		// 2. Read single Parquet file
+	for _, fileObj := range files {
 		packets, readErr := pd.readParquetFile(fileObj)
 		if readErr != nil {
-			pd.logger.Error("pseudo driver failed to read parquet file, skipping",
-				zap.String("subscriptionId", sub.ID),
-				zap.String("file", fileObj),
-				zap.Error(readErr),
-			)
 			continue
 		}
-
 		if len(packets) == 0 {
 			continue
 		}
-
-		// 3. Filter packets by subscription target
 		filtered := pd.filterBySubscription(packets, sub)
 		if len(filtered) == 0 {
 			continue
 		}
-		totalPacketsMatched += len(filtered)
 
-		// Find local time range of this file BEFORE adjusting to global time
 		minTS := filtered[0].timestamp
 		maxTS := filtered[0].timestamp
 		for _, pkt := range filtered[1:] {
@@ -261,58 +282,71 @@ func (pd *PseudoDriver) LoadAndReplay(sub *Subscription) {
 			}
 		}
 
-		// 4. Adjust timestamps to the unified global timeline and append
+		// Adjust timestamps to unified global timeline
 		for i := range filtered {
-			// Normalize to start at 0, then shift by the accumulated global offset
-			filtered[i].timestamp = (filtered[i].timestamp - minTS) + globalTimeOffset
-			allHistoricalPackets = append(allHistoricalPackets, filtered[i])
+			globalTS := (filtered[i].timestamp - minTS) + globalTimeOffset
+			filtered[i].timestamp = globalTS
+			if globalTS <= breakingTimeSec {
+				phase1Packets = append(phase1Packets, filtered[i])
+			} else {
+				phase2Packets = append(phase2Packets, filtered[i])
+			}
 		}
-
-		// Update global offset for the next file (+1ms gap)
 		globalTimeOffset += (maxTS - minTS) + 0.001
 	}
 
-	// 5. Aggregate into continuous windows ENTIRELY across the unified timeline
-	// We pass referenceTime so all windows share the same absolute time baseline
-	windows := pd.aggregateIntoWindows(allHistoricalPackets, periodSec, referenceTime)
+	// =====================================================================
+	// PHASE 1: Warmstart (Historical Burst)
+	// =====================================================================
+	pd.logger.Info("pseudo driver: executing Phase 1 (Warmstart)",
+		zap.Int("packets", len(phase1Packets)),
+	)
 
-	// 6. Send each window as a notification sequentially
-	for _, measures := range windows {
-		if notifyErr := pd.notifier.Notify(sub, measures); notifyErr != nil {
-			pd.logger.Warn("pseudo driver: notify failed for window",
-				zap.String("subscriptionId", sub.ID),
-				zap.Error(notifyErr),
-			)
-		} else {
-			totalSentCount++
-		}
-	}
-
-	// Record the absolute end time of the last historical window.
-	// The live Aggregator will clamp StartTime to never go before this,
-	// preventing time regression at the handoff point.
-	if len(windows) > 0 {
-		lastWindow := windows[len(windows)-1]
-		// Find the latest EndTime across all UE measures in the last window
-		for _, m := range lastWindow {
-			if m.EndTime.After(sub.WarmStartEndTime) {
-				sub.WarmStartEndTime = m.EndTime
+	if len(phase1Packets) > 0 {
+		// The window spanning exact breakingTimeSec belongs to Phase 2 (live).
+		// So Phase 1 ends one window before it.
+		endWIdx := int(math.Floor(breakingTimeSec/float64(periodSec))) - 1
+		windows := pd.aggregateIntoWindows(phase1Packets, periodSec, referenceTime, endWIdx)
+		for wIdx, measures := range windows {
+			// logical time for this window is referenceTime + (wIdx+1)*periodSec
+			logicalTime := referenceTime.Add(time.Duration((wIdx+1)*periodSec) * time.Second)
+			if pd.aggregator != nil {
+				pd.aggregator.PushHistoricalMeasures(sub, measures, logicalTime)
 			}
 		}
-		pd.logger.Info("pseudo driver: warm-start end time recorded",
-			zap.Time("warmStartEndTime", sub.WarmStartEndTime),
-		)
+	} else {
+		// Even if no packets, we MUST fast-forward LastNotify so live traffic doesn't dump huge delta
+		logicalTime := referenceTime.Add(time.Duration(breakingTimeSec * float64(time.Second)))
+		sub.LastNotify = logicalTime
 	}
 
-	// Update LastNotify to avoid immediate live notification overlap
-	sub.LastNotify = time.Now()
-
-	pd.logger.Info("pseudo driver: full warm-start replay complete",
-		zap.String("subscriptionId", sub.ID),
-		zap.Int("totalWindowsSent", totalSentCount),
-		zap.Int("totalPacketsMatched", totalPacketsMatched),
-		zap.Float64("totalContinuousDurationSec", globalTimeOffset),
+	// =====================================================================
+	// PHASE 2: Parallel Future Simulation
+	// =====================================================================
+	pd.logger.Info("pseudo driver: executing Phase 2 (Future Simulation)",
+		zap.Int("packets", len(phase2Packets)),
 	)
+
+	if len(phase2Packets) > 0 && pd.aggregator != nil {
+		// CRITICAL: Pre-activate Phase 2 state BEFORE entering the simulation loop.
+		// Without this, there's a gap between Phase 1 ending and Phase 2's first
+		// sleep where Kernel reports slip through with unaligned timestamps,
+		// causing the time to "jitter" forward/backward by one window.
+		firstP2WIdx := int(math.Floor(breakingTimeSec/float64(periodSec))) + 1
+		firstP2Start := referenceTime.Add(time.Duration(float64(firstP2WIdx)*float64(periodSec)) * time.Second)
+		firstP2End := firstP2Start.Add(time.Duration(periodSec) * time.Second)
+		pd.simMu.Lock()
+		pd.isSimulating = true
+		pd.phase2StartTime = firstP2Start
+		pd.phase2EndTime = firstP2End
+		pd.simMu.Unlock()
+		pd.logger.Info("pseudo driver: Phase 2 pre-activated to close timing gap",
+			zap.Time("firstWindowStart", firstP2Start),
+			zap.Time("firstWindowEnd", firstP2End),
+		)
+
+		pd.simulateFutureRealTime(sub, phase2Packets, periodSec, referenceTime, breakingTimeSec)
+	}
 }
 
 // readParquetFile reads all rows from the specified Parquet file and converts to parsedPacket.
@@ -393,7 +427,7 @@ func (pd *PseudoDriver) filterBySubscription(packets []parsedPacket, sub *Subscr
 // aggregateIntoWindows groups packets into time windows and produces
 // a slice of []UsageMeasures for each window, ordered by time.
 // Since timestamps are already shifted, window indices naturally align globally.
-func (pd *PseudoDriver) aggregateIntoWindows(packets []parsedPacket, periodSec int, referenceTime time.Time) [][]UsageMeasures {
+func (pd *PseudoDriver) aggregateIntoWindows(packets []parsedPacket, periodSec int, referenceTime time.Time, endWindowIndex int) [][]UsageMeasures {
 	if len(packets) == 0 {
 		return nil
 	}
@@ -412,7 +446,7 @@ func (pd *PseudoDriver) aggregateIntoWindows(packets []parsedPacket, periodSec i
 
 	accum := make(map[windowKey]*counterAccum)
 	uniqueUEs := make(map[string]bool)
-	maxWindowIndex := 0
+	maxWindowIndex := endWindowIndex
 
 	for _, pkt := range packets {
 		// global offset is 0-indexed across all files now
@@ -456,8 +490,15 @@ func (pd *PseudoDriver) aggregateIntoWindows(packets []parsedPacket, periodSec i
 	for wIdx := 0; wIdx <= maxWindowIndex; wIdx++ {
 		windowStartOff := float64(wIdx) * period
 		windowEndOff := windowStartOff + period
-		defaultStartT := referenceTime.Add(time.Duration(windowStartOff * float64(time.Second)))
-		defaultEndT := referenceTime.Add(time.Duration(windowEndOff * float64(time.Second)))
+
+		// Use integer conversion and truncate to Millisecond to completely eliminate
+		// float64 precision noise. This guarantees the generated time will perfectly
+		// match the snapTime() logic in the Aggregator.
+		offsetStart := time.Duration(math.Round(windowStartOff * float64(time.Second)))
+		offsetEnd := time.Duration(math.Round(windowEndOff * float64(time.Second)))
+
+		defaultStartT := referenceTime.Add(offsetStart).Truncate(time.Millisecond)
+		defaultEndT := referenceTime.Add(offsetEnd).Truncate(time.Millisecond)
 
 		for ueIP := range uniqueUEs {
 			key := windowKey{ueIP: ueIP, windowIndex: wIdx}
@@ -509,4 +550,147 @@ func (pd *PseudoDriver) aggregateIntoWindows(packets []parsedPacket, periodSec i
 	}
 
 	return result
+}
+
+func (pd *PseudoDriver) simulateFutureRealTime(sub *Subscription, packets []parsedPacket, periodSec int, referenceTime time.Time, breakingTimeSec float64) {
+	period := float64(periodSec)
+
+	// Mark Phase 2 as active — Kernel reports will be TIME-ALIGNED to Phase 2's window
+	pd.simMu.Lock()
+	pd.isSimulating = true
+	pd.simMu.Unlock()
+	defer func() {
+		pd.simMu.Lock()
+		pd.isSimulating = false
+		pd.simMu.Unlock()
+		pd.logger.Info("pseudo driver: Phase 2 simulation ended, Kernel reports back to normal")
+	}()
+
+	// Calculate how many windows there are starting from the breaking time
+	maxTS := 0.0
+	for _, pkt := range packets {
+		if pkt.timestamp > maxTS {
+			maxTS = pkt.timestamp
+		}
+	}
+
+	// We start our simulation AT the window corresponding to the breaking time.
+	// Since referenceTime = anchor - breakingTimeSec, the offset of breakingTimeSec
+	// coincides exactly with the anchor time.
+	startWIdx := int(math.Floor(breakingTimeSec / period))
+	endWIdx := int(math.Floor(maxTS / period))
+
+	totalWindows := endWIdx - startWIdx + 1
+	if totalWindows <= 0 {
+		pd.logger.Warn("pseudo driver: Phase 2 has no windows to simulate")
+		return
+	}
+
+	pd.logger.Info("pseudo driver: Phase 2 future simulation started",
+		zap.Int("startWIdx", startWIdx),
+		zap.Int("endWIdx", endWIdx),
+		zap.Int("totalWindows", totalWindows),
+	)
+
+	// =====================================================================
+	// STAGE 1: PRE-COMPUTE all Phase 2 window data upfront.
+	// This eliminates any per-window computation delay during the real-time
+	// pacing loop. All Parquet aggregation happens here, once, instantly.
+	// =====================================================================
+	type precomputedWindow struct {
+		startTime time.Time
+		endTime   time.Time
+		measures  []UsageMeasures
+	}
+
+	precomputed := make([]precomputedWindow, 0, totalWindows)
+
+	for wIdx := startWIdx; wIdx <= endWIdx; wIdx++ {
+		windowStartOff := float64(wIdx) * period
+		windowEndOff := windowStartOff + period
+
+		// Use integer conversion and truncate to Millisecond to completely eliminate
+		// float64 precision noise. This guarantees the generated time will perfectly
+		// match the snapTime() logic in the Aggregator, allowing Kernel reports to merge.
+		offsetStart := time.Duration(math.Round(windowStartOff * float64(time.Second)))
+		offsetEnd := time.Duration(math.Round(windowEndOff * float64(time.Second)))
+
+		defaultStartT := referenceTime.Add(offsetStart).Truncate(time.Millisecond)
+		defaultEndT := referenceTime.Add(offsetEnd).Truncate(time.Millisecond)
+
+		// Collect packets belonging to this window
+		ueAccum := make(map[string]*UsageMeasures)
+		for _, pkt := range packets {
+			pktWindowIdx := int(math.Floor(pkt.timestamp / period))
+			if pktWindowIdx == wIdx {
+				m, exists := ueAccum[pkt.ueIP]
+				if !exists {
+					m = &UsageMeasures{
+						Key:        SessionKey{LocalSEID: uint64(wIdx + 1)},
+						StartTime:  defaultStartT,
+						EndTime:    defaultEndT,
+						UeIpv4Addr: pkt.ueIP,
+					}
+					ueAccum[pkt.ueIP] = m
+				}
+				if pkt.isUplink {
+					m.ULBytesDelta += pkt.pktLen
+					m.ULPacketsDelta++
+				} else {
+					m.DLBytesDelta += pkt.pktLen
+					m.DLPacketsDelta++
+				}
+			}
+		}
+
+		measures := make([]UsageMeasures, 0, len(ueAccum))
+		for _, m := range ueAccum {
+			computeThroughputIfPossible(m)
+			measures = append(measures, *m)
+		}
+
+		precomputed = append(precomputed, precomputedWindow{
+			startTime: defaultStartT,
+			endTime:   defaultEndT,
+			measures:  measures,
+		})
+	}
+
+	pd.logger.Info("pseudo driver: Phase 2 pre-computation complete",
+		zap.Int("windowsComputed", len(precomputed)),
+	)
+
+	// =====================================================================
+	// STAGE 2: AGGREGATOR-SYNCHRONIZED PACING.
+	// Instead of an independent ticker, Phase 2 rides the Aggregator's
+	// TickOnce heartbeat via WaitForTick(). This guarantees:
+	// 1. Phase 2 data is in the buffer BEFORE TickOnce fires.
+	// 2. Kernel reports have a full 5-second window to arrive and merge.
+	// 3. Zero phase offset between production and consumption.
+	// =====================================================================
+	for i, win := range precomputed {
+		// Push pre-computed Parquet data into the Aggregator's buffer IMMEDIATELY.
+		// This happens BEFORE TickOnce fires, so the data is ready for merging.
+		if len(win.measures) > 0 && pd.aggregator != nil {
+			pd.logger.Debug("pseudo driver: pushing Phase 2 pre-computed data",
+				zap.Int("windowIndex", i),
+				zap.Int("measures", len(win.measures)),
+				zap.Time("startTime", win.startTime),
+			)
+			pd.aggregator.PushLiveMeasures(sub, win.measures)
+		}
+
+		// Publish current Phase 2 window time for SnapTime alignment.
+		pd.simMu.Lock()
+		pd.phase2StartTime = win.startTime
+		pd.phase2EndTime = win.endTime
+		pd.simMu.Unlock()
+
+		// Wait for Aggregator's TickOnce to process this batch.
+		// After TickOnce sends out the merged notification, it signals us
+		// to push the next window's data.
+		pd.aggregator.WaitForTick()
+	}
+
+	pd.logger.Info("pseudo driver: Phase 2 future simulation completed")
 }

@@ -164,10 +164,10 @@ func (u *UpfApp) Run() error {
 	u.pfcpServer.Start(&u.wg)
 
 	// =========================================================================
-	// [New] EES initialization logic (Pure Push mode - no polling)
+	// [New] EES initialization logic — branches on Mode: vanilla vs pseudo
 	// =========================================================================
 	if u.cfg.EES != nil && u.cfg.EES.Enabled {
-		logger.MainLog.Infoln("Starting EES Module (Pure Push Mode)...")
+		logger.MainLog.Infof("Starting EES Module (Hybrid Mode)...")
 
 		// 1. Create Logger
 		eesLogger, err := zap.NewDevelopment()
@@ -176,7 +176,7 @@ func (u *UpfApp) Run() error {
 			eesLogger = zap.NewNop() // Fallback to no-op logger
 		}
 
-		// 2. Create Store / Notifier / Aggregator
+		// 2. Create Store / Notifier (shared by both modes)
 		subscriptionStore := ees.NewSubscriptionStore("")
 		notifier := ees.NewNotifier(eesLogger)
 
@@ -185,6 +185,25 @@ func (u *UpfApp) Run() error {
 			period = u.cfg.EES.PeriodSec
 		}
 
+		listenAddr := u.cfg.EES.ListenAddr
+		if listenAddr == "" {
+			listenAddr = ":8088"
+		}
+
+		// 3. Initialize PseudoDriver (Default to "pre_data" if not set)
+		var pseudoDriver *ees.PseudoDriver
+		parquetDir := u.cfg.EES.ParquetDir
+		if parquetDir == "" {
+			parquetDir = "pre_data"
+		}
+		if _, err := os.Stat(parquetDir); !os.IsNotExist(err) {
+			pseudoDriver = ees.NewPseudoDriver(parquetDir, notifier, eesLogger)
+			logger.MainLog.Infof("EES PseudoDriver (Hybrid Mode) enabled with parquet directory: %s", parquetDir)
+		} else {
+			logger.MainLog.Infof("EES PseudoDriver disabled (parquet directory not found: %s)", parquetDir)
+		}
+
+		// 4. Initialize Kernel integration components
 		// Pure Push mode: Reports come from kernel
 		localNode := u.pfcpServer.GetLocalNode()
 		sessionProvider := localNode
@@ -195,35 +214,31 @@ func (u *UpfApp) Run() error {
 			perioServer = gtp5gDriver.GetPerioServer()
 		}
 
-		// Create PseudoDriver for warm-start FIRST so it can be passed to Aggregator
-		parquetDir := u.cfg.EES.ParquetDir
-		if parquetDir == "" {
-			parquetDir = "pre_data" // default directory relative to go-upf
-		}
-		pseudoDriver := ees.NewPseudoDriver(parquetDir, notifier, eesLogger)
-		logger.MainLog.Infof("EES PseudoDriver enabled with parquet directory: %s", parquetDir)
-
+		// 5. Create Aggregator (Handles both kernel and pseudoDriver data)
 		aggregator := ees.NewAggregator(
 			subscriptionStore,
 			time.Duration(period)*time.Second,
 			notifier,
 			eesLogger,
 			sessionProvider,
-			perioServer,  // Pass perioServer for period validation
-			pseudoDriver, // Pass pseudoDriver to receive URR signals
+			perioServer,
+			pseudoDriver,
 		)
 
-		// 3. Register EES Handler to Dispatcher
-		eesHandler := ees.NewHandler(aggregator, eesLogger)
-		reportDispatcher.RegisterEESHandler(eesHandler, aggregator) // Pass aggregator for callbacks
+		if pseudoDriver != nil {
+			pseudoDriver.SetAggregator(aggregator)
+		}
 
-		// Set perioServer for dispatcher callbacks
+		// 6. Register EES Handler to Dispatcher (kernel → Aggregator)
+		eesHandler := ees.NewHandler(aggregator, eesLogger)
+		reportDispatcher.RegisterEESHandler(eesHandler, aggregator)
+
+		// 7. Register perioServer callback
 		if perioServer != nil {
 			reportDispatcher.SetPerioServer(perioServer)
 
 			// Register callback to adjust aggregator period when URR is added
 			perioServer.SetOnURRAdded(func(urrid uint32, period time.Duration) {
-				// Only adjust for URR 2 (the periodic measurement URR)
 				if urrid == 2 {
 					logger.MainLog.Infof("EES: URR %d added with period %v, triggering aggregator adjustment", urrid, period)
 					aggregator.AdjustReportPeriod(period)
@@ -231,24 +246,18 @@ func (u *UpfApp) Run() error {
 			})
 		}
 
-		// 4. Start Aggregator (processes buffered reports periodically)
+		// 8. Start Aggregator (Handles background buffering/dispatching)
 		go aggregator.Run(u.ctx)
 
-		// 5. Start API Server (simplified - no Shadow URR provisioning)
-		listenAddr := u.cfg.EES.ListenAddr
-		if listenAddr == "" {
-			listenAddr = ":8088"
-		}
-
+		// 9. Start API Server
 		apiServer := ees.NewServer(subscriptionStore, aggregator, eesLogger, pseudoDriver)
-
 		go func() {
 			if err := apiServer.Serve(listenAddr); err != nil {
 				logger.MainLog.Errorf("EES API Server Error: %v", err)
 			}
 		}()
 
-		logger.MainLog.Infof("EES started at %s with period %ds (Pure Push Mode - SMF URR)", listenAddr, period)
+		logger.MainLog.Infof("EES started at %s with period %ds (Hybrid Parallel Mode)", listenAddr, period)
 	}
 	// =========================================================================
 

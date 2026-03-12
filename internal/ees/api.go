@@ -151,11 +151,15 @@ func (server *Server) handleCreateSubscription(w http.ResponseWriter, r *http.Re
 	// On-demand mode: trigger immediate report
 	if subscriptionCandidate.Mode == ModeOnDemand {
 		go func() {
-			if _, tickErr := server.aggregator.TickOnce(context.Background()); tickErr != nil {
-				server.logger.Warn("ees on-demand immediate tick failed",
-					zap.String("subscriptionId", subscriptionID),
-					zap.Error(tickErr),
-				)
+			if server.pseudoDriver == nil {
+				if _, tickErr := server.aggregator.TickOnce(context.Background()); tickErr != nil {
+					server.logger.Warn("ees on-demand immediate tick failed",
+						zap.String("subscriptionId", subscriptionID),
+						zap.Error(tickErr),
+					)
+				}
+			} else {
+				server.logger.Debug("ees on-demand mode: skipping aggregator tick in pseudo mode")
 			}
 		}()
 	}
