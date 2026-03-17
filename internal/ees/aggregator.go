@@ -58,6 +58,10 @@ type Aggregator struct {
 	lastTickTime time.Time     // Wall-clock time of most recent TickOnce
 	lastTickMu   sync.RWMutex
 
+	// Kernel Ticker synchronization: align Aggregator heartbeat with Kernel
+	firstURRReceived bool // Marks if the first real Kernel URR has arrived
+	startMu          sync.Mutex
+
 	// [Legacy] State cache: kept for delta computation if needed
 	// Key: SessionKey, Value: Last Counters
 	lastSnapshot map[SessionKey]Counters
@@ -140,12 +144,11 @@ func (aggregator *Aggregator) Run(parentContext context.Context) {
 				aggregator.logger.Info("ees ticker reset signal received, recreating ticker")
 				break tickerLoop
 			case <-tickerC:
-				// Wait briefly to allow 'perio' ticker (which fires simultaneously)
+				// Wait 500ms to allow 'perio' ticker (which fires simultaneously)
 				// to fetch Kernel reports and push them into our buffer.
-				// This ensures Phase 2 and Kernel data for the SAME window are
-				// processed and sent in the SAME Notification, rather than Kernel
-				// lagging behind by one tick.
-				time.Sleep(100 * time.Millisecond)
+				// 500ms is much safer than 100ms to handle system scheduling
+				// jitter and avoid Kernel reports "missing the boat".
+				time.Sleep(500 * time.Millisecond)
 
 				// Record tick time BEFORE processing
 				// CRITICAL FIX: time.Now() has millisecond/microsecond jitter (e.g. .663Z).
@@ -156,13 +159,13 @@ func (aggregator *Aggregator) Run(parentContext context.Context) {
 				aggregator.lastTickMu.Lock()
 				nowRaw := time.Now()
 				if aggregator.lastTickTime.IsZero() {
-					// First tick: completely strip the sub-second fraction to establish a perfect grid
+					// First tick: strip the sub-second fraction OR align precisely to Kernel's arrival
 					aggregator.lastTickTime = nowRaw.Truncate(time.Second)
 				} else {
 					// Subsequent ticks: rigidly advance by exactly one period.
 					// This completely ignores Ticker jitter and OS scheduling delays,
 					// ensuring the grid remains perfectly mathematically aligned forever.
-					aggregator.lastTickTime = aggregator.lastTickTime.Add(currentPeriod)
+					aggregator.lastTickTime = aggregator.lastTickTime.Add(currentPeriod).Truncate(time.Second)
 				}
 				aggregator.lastTickMu.Unlock()
 
@@ -191,6 +194,17 @@ func (aggregator *Aggregator) getTicker() *time.Ticker {
 // Used by Phase 2 to synchronize with Aggregator's heartbeat.
 func (aggregator *Aggregator) WaitForTick() {
 	<-aggregator.tickDone
+}
+
+// DrainTickDone removes any stale tickDone signal from the channel.
+// Must be called before Phase 2's pacing loop to prevent the first
+// WaitForTick() from returning immediately due to a signal that was
+// sent during Phase 1 historical replay.
+func (aggregator *Aggregator) DrainTickDone() {
+	select {
+	case <-aggregator.tickDone:
+	default:
+	}
 }
 
 // GetLastTickTime returns the wall-clock time of the most recent TickOnce trigger.
@@ -222,13 +236,13 @@ func (aggregator *Aggregator) TickOnce(ctx context.Context) (int, error) {
 	newBuffer := make(map[string][]UsageMeasures)
 	aggregator.mu.Unlock()
 
-	aggregator.logger.Info("ees tick - processing buffer",
-		zap.Int("subscriptionCount", len(bufferedReports)),
-		zap.Time("currentTime", now),
-	)
-
 	// Iterate over all subscriptions
 	subscriptions := aggregator.subscriptionStore.AllSubscriptions()
+
+	aggregator.logger.Info("ees tick starting",
+		zap.Int("subscriptionCount", len(subscriptions)),
+		zap.Time("currentTime", now),
+	)
 
 	for _, subscription := range subscriptions {
 		// MVP scope: only USER_DATA_USAGE_MEASURES + perPduSession
@@ -265,9 +279,12 @@ func (aggregator *Aggregator) TickOnce(ctx context.Context) (int, error) {
 			periodDuration := time.Duration(subscription.PeriodSec) * time.Second
 			timeSinceLastNotify := now.Sub(subscription.LastNotify)
 
-			// Add small tolerance (100ms) to avoid timer precision issues
-			// This prevents delays due to minor timing variations (e.g., 29.98s being treated as < 30s)
-			const tolerance = 100 * time.Millisecond
+			// Add tolerance to absorb timing jitter from:
+			// 1. The 100ms sleep we added before TickOnce (to wait for Kernel reports)
+			// 2. OS/Go runtime scheduling delays
+			// 3. Ticker precision variations
+			// 1000ms is safe because Ticker guarantees 5s gaps.
+			const tolerance = 1000 * time.Millisecond
 
 			if timeSinceLastNotify+tolerance < periodDuration {
 				// Not time to notify yet - keep reports in buffer for next tick
@@ -296,12 +313,9 @@ func (aggregator *Aggregator) TickOnce(ctx context.Context) (int, error) {
 		periodDuration := time.Duration(subscription.PeriodSec) * time.Second
 
 		// 1. Time Window Snapping (Before Consolidation)
-		// Snap the END TIME to the grid, then calculate StartTime.
-		// Why EndTime? Because Kernel reports define StartTime as the arrival of the FIRST packet
-		// in the measurement period, which could be anywhere (e.g., .1, .9).
-		// By snapping the EndTime (when the report is generated, e.g., slightly after the period ends),
-		// we correctly attribute the Kernel report to the exact Phase 2 window it belongs to.
 		for i := range usageMeasuresList {
+			oldStart := usageMeasuresList[i].StartTime
+			oldEnd := usageMeasuresList[i].EndTime
 			if !subscription.GridAnchor.IsZero() {
 				snappedEnd := snapTime(usageMeasuresList[i].EndTime, subscription.GridAnchor, periodDuration)
 				usageMeasuresList[i].EndTime = snappedEnd
@@ -311,6 +325,13 @@ func (aggregator *Aggregator) TickOnce(ctx context.Context) (int, error) {
 				usageMeasuresList[i].EndTime = snappedEnd
 				usageMeasuresList[i].StartTime = snappedEnd.Add(-periodDuration)
 			}
+			aggregator.logger.Debug("ees snap result",
+				zap.Int("idx", i),
+				zap.Time("oldEnd", oldEnd),
+				zap.Time("newEnd", usageMeasuresList[i].EndTime),
+				zap.Time("oldStart", oldStart),
+				zap.Time("newStart", usageMeasuresList[i].StartTime),
+			)
 		}
 
 		// 2. Consolidate reports: group by (IP + SnappedStartTime)
@@ -395,28 +416,49 @@ func snapTime(t time.Time, anchor time.Time, period time.Duration) time.Time {
 		roundedOffset = ((offset - halfPeriod) / period) * period
 	}
 
-	// Truncate to millisecond to definitively wipe out any stray nanosecond noise
-	return anchor.Add(roundedOffset).Truncate(time.Millisecond)
+	// Truncate to second to definitively wipe out any sub-second noise
+	return anchor.Add(roundedOffset).Truncate(time.Second)
 }
 
 func (aggregator *Aggregator) PushHistoricalMeasures(sub *Subscription, measures []UsageMeasures, logicalTime time.Time) {
 	if len(measures) == 0 {
 		return
 	}
-	// For historical data, we bypass the reportBuffer and send immediately
-	if err := aggregator.notifier.Notify(sub, measures); err != nil {
-		aggregator.logger.Warn("ees notify (historical) failed", zap.Error(err))
-	} else {
-		aggregator.logger.Debug("ees notify (historical) success", zap.Time("logicalTime", logicalTime))
-	}
-	// Anchor the last notify time so live traffic aligns its next tick correctly
-	sub.LastNotify = logicalTime
+	// By user design: Place historical data into the shared buffer instead of
+	// sending immediately. This guarantees that Phase 1 historical data will
+	// perfectly merge with any overlapping real-time URR data via the native
+	// consolidateReports() logic during the next TickOnce.
+	aggregator.mu.Lock()
+	defer aggregator.mu.Unlock()
+	aggregator.reportBuffer[sub.ID] = append(aggregator.reportBuffer[sub.ID], measures...)
 }
 
 func (aggregator *Aggregator) PushLiveMeasures(sub *Subscription, measures []UsageMeasures) {
 	if len(measures) == 0 {
 		return
 	}
+
+	// CRITICAL FIX: Ticker Re-sync Mechanism
+	// We want the Aggregator's timer to be perfectly out-of-phase with the
+	// Kernel's perio server (which generates these measures). By resetting
+	// our Ticker exactly when the FIRST kernel measure arrives, we guarantee
+	// our future ticks will fire exactly 5s after Kernel does + 500ms jitter sleep.
+	// This ensures we NEVER check the buffer 8ms BEFORE Kernel drops the info.
+	aggregator.startMu.Lock()
+	if !aggregator.firstURRReceived {
+		aggregator.firstURRReceived = true
+		aggregator.logger.Info("ees aggregator received first live URR, forcing Ticker re-sync",
+			zap.String("subscriptionId", sub.ID),
+			zap.Time("arrival_time", time.Now()),
+		)
+		// Non-blocking trigger to recreate the Ticker in Run loop
+		select {
+		case aggregator.tickerReset <- struct{}{}:
+		default:
+		}
+	}
+	aggregator.startMu.Unlock()
+
 	aggregator.mu.Lock()
 	defer aggregator.mu.Unlock()
 	aggregator.reportBuffer[sub.ID] = append(aggregator.reportBuffer[sub.ID], measures...)
@@ -441,8 +483,8 @@ func consolidateReports(reports []UsageMeasures) []UsageMeasures {
 			key = fmt.Sprintf("seid-%d-%d", r.Key.LocalSEID, r.Key.RemoteSEID)
 		}
 
-		// Group by both IP and snapped StartTime
-		timeKey := fmt.Sprintf("%s-%d", key, r.StartTime.UnixNano())
+		// Group by both IP and snapped StartTime (rounded to nearest second)
+		timeKey := fmt.Sprintf("%s-%d", key, r.StartTime.Unix())
 
 		existing, ok := consolidated[timeKey]
 		if !ok {
