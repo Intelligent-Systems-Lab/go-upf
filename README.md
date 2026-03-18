@@ -97,26 +97,27 @@ The notification is sent as HTTP POST to the `eventNotifyUri`:
 
 ## Architecture
 
-The EES uses a **Pure Push model** – SMF-provisioned URRs generate usage reports that are pushed from the kernel via Handler to the Aggregator. No Shadow URRs are created; we leverage existing SMF URR data.
+The EES uses a **Hybrid Push model** – combining real-time reports pushed from the kernel (via SMF-provisioned URRs) with historical traffic replay from a **Pseudo Driver**.
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                           go-upf                                 │
-│                                                                  │
-│  ┌──────────┐    ┌────────────┐    ┌──────────┐                 │
-│  │API Server│───▶│ Aggregator │───▶│ Notifier │──▶ HTTP POST    │
-│  └──────────┘    └─────▲──────┘    └──────────┘                 │
-│                        │ PushReport                              │
-│                        │                                         │
-│                   ┌────┴─────┐                                  │
-│                   │ Handler  │◀── URR 2 (MAQE) Reports          │
-│                   └──────────┘                                  │
-│                        ▲                                         │
-│                        │ Periodic USA Reports                    │
-│  ┌──────────────────────────────────────────────────────────┐   │
-│  │                  gtp5g Kernel Module                      │   │
-│  └──────────────────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                                   go-upf                                    │
+│                                                                             │
+│  ┌──────────┐      ┌────────────┐      ┌──────────┐                         │
+│  │API Server│──┬──▶│ Aggregator │──┬──▶│ Notifier │──▶ HTTP POST            │
+│  └──────────┘  │   └─────▲──────┘  │   └──────────┘                         │
+│                │         │         │                                        │
+│                │   ┌─────┴─────┐   │        ┌───────────────┐               │
+│                │   │ Handler   │◀──┼────────│ Pseudo Driver │               │
+│                │   └───────────┘   │        └───────▲───────┘               │
+│                │         ▲         │                │                       │
+│                └─────────┼─────────┘                │                       │
+│                          │ PushReport               │ Read Parquet          │
+│                          │                          │                       │
+│           ┌─────────────────────────────┐    ┌──────────────┐               │
+│           │     gtp5g Kernel Module     │    │ Parquet Files│               │
+│           └─────────────────────────────┘    └──────────────┘               │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
 #### Changing file in smf `smf/internal/contet/pfcp_rules.go` is required
 ```c
@@ -148,63 +149,38 @@ sequenceDiagram
     participant Aggregator as Aggregator
     participant Notifier as Notifier
 
-    %% 顏色定義 (使用淺色系)
+    %% Color definitions (using light colors)
     rect rgb(240, 248, 255)
-    Note over NF,Kernel: Pre Phase : SMF 透過 PFCP 設置 URR
-    NF->>Kernel: PFCP Session Establishment<br/>設置 URR 2 (N3N6_MAQE, MAQE)
-    Note over Kernel: Kernel 開始收集流量統計<br/>(UL/DL bytes, packets)
+    Note over NF,Kernel: Pre Phase: SMF Provisions URR via PFCP
+    NF->>Kernel: PFCP Session Establishment<br/>Establish URR 2 (N3N6_MAQE, MAQE)
+    Note over Kernel: Kernel starts collecting traffic stats
     end
 
     rect rgb(255, 250, 230)
-    %% Phase 1: 訂閱創建
-    Note over NF,API: Phase 1: 訂閱創建
-    NF->>+API: POST /nupf-ee/v1/ee-subscriptions<br/>(eventType, measurementTypes, notifyUri, reportPeriod)
-    API->>API: validateAndBuildSubscription()<br/>驗證參數、granularity、targeting
+    %% Phase 1: Subscription & Warm Start
+    Note over NF,Pseudo: Phase 1: Subscription & Warm Start
+    NF->>+API: POST /nupf-ee/v1/ee-subscriptions
     API->>Store: AddSubscription()
-    Store-->>API: subscriptionId
-    API->>Aggregator: AdjustReportPeriod(urrPeriod)
-    Note over Aggregator: 當第一個訂閱建立時<br/>調整報告週期為 URR 週期
-    API-->>-NF: 201 Created<br/>Location: /ee-subscriptions/{id}<br/>返回 subscriptionId
+    API->>Pseudo: LoadAndReplay(sub)
+    Note over Pseudo: Phase 1: Instant replay of<br/>historical bursts to buffer
+    Pseudo->>Aggregator: PushHistoricalMeasures()
+    API-->>-NF: 201 Created (with historical data via burst)
     end
 
     rect rgb(245, 255, 245)
-    %% Phase 2: 週期性報告推送
-    Note over Kernel,Notifier: Phase 2: 週期性數據報告 (Pure Push Model)
-    loop 每個 URR 週期 (例如 10 秒)
-        Kernel->>Handler: Push SessReport<br/>(SEID, URR Reports with usage data)
-        Handler->>Handler: NotifySessReport()
-        Handler->>Aggregator: PushReport(sessRpt)
-        Note over Aggregator: 將報告存入 reportBuffer<br/>按 SessionKey 分組
-        Aggregator->>Aggregator: matchesSubscription()<br/>檢查是否匹配訂閱的 UE
-        Aggregator->>Aggregator: computeThroughputIfPossible()
-    end
-    end
-
-    rect rgb(255, 240, 245)
-    %% Phase 3: 聚合與通知
-    Note over Aggregator,Notifier: Phase 3: 聚合與通知發送
-    loop 每個訂閱的 reportPeriod (例如 30 秒)
-        Aggregator->>Aggregator: TickOnce()
-        Note over Aggregator: 檢查訂閱是否到達通知時間
-        Aggregator->>Aggregator: consolidateReports()<br/>合併同一 session 的多個報告
-        Note over Aggregator: 將多個 URR 週期的數據求和
-        Aggregator->>Notifier: Notify(subscription, measures)
-        Notifier->>Notifier: 構建 NotificationData
+    %% Phase 2: Live Sync & Hybrid Reporting
+    Note over Kernel,Pseudo: Phase 2: Live Sync & Hybrid Reporting
+    Kernel->>Handler: First Live URR
+    Handler->>Aggregator: PushReport()
+    Aggregator->>Pseudo: SignalFirstURR(anchorTime)
+    Note over Pseudo: Grid Calibration: Align simulation<br/>to Kernel Ticker heartbeat
+    loop Every Aggregator Tick
+        Pseudo->>Aggregator: PushLiveMeasures() (Simulated Future)
+        Kernel->>Aggregator: PushReport() (Real-time Kernel)
+        Aggregator->>Aggregator: TickOnce() & Grid Alignment
+        Aggregator->>Notifier: Notify(subscription, consolidatedMeasures)
         Notifier->>NF: HTTP POST to notifyUri
-        NF-->>Notifier: 200 OK
-        Notifier-->>Aggregator: Success
-        Note over Aggregator: 更新 lastNotificationTime
-        Aggregator->>Aggregator: 清空該訂閱的 reportBuffer
     end
-    end
-
-    rect rgb(245, 245, 245)
-    %% Case : 訂閱刪除
-    Note over NF,Store: Case : 訂閱刪除
-    NF->>API: DELETE /nupf-ee/v1/ee-subscriptions/{id}
-    API->>Store: RemoveSubscription(id)
-    Store-->>API: Success
-    API-->>NF: 204 No Content
     end
 ```
 
@@ -219,6 +195,7 @@ EES:
   Enabled: true
   ListenAddr: "0.0.0.0:8088"
   PeriodSec: 10
+  ParquetDir: "pre_data" # Optional: directory for warm-start data
 ```
 
 ---
@@ -348,6 +325,7 @@ curl -X POST http://127.0.0.1:8088/nupf-ee/v1/ee-subscriptions \
 |------|---------|
 | `internal/ees/api.go` | REST API handlers and subscription validation |
 | `internal/ees/aggregator.go` | Report buffering, consolidation, and periodic dispatch |
+| `internal/ees/pseudodriver.go` | Warm-start historical replay from Parquet files |
 | `internal/ees/handler.go` | Receives kernel URR reports and forwards to Aggregator |
 | `internal/ees/notifier.go` | TS 29.564 payload construction and HTTP delivery |
 | `internal/ees/subscription_store.go` | Thread-safe in-memory subscription management |
