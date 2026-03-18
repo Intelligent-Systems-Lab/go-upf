@@ -244,13 +244,15 @@ func (pd *PseudoDriver) LoadAndReplay(sub *Subscription) {
 	)
 
 	select {
-	case <-pd.FirstURRSignal:
-		pd.logger.Info("pseudo driver: first URR received, waiting for next TickOnce to anchor")
-		// Wait for the next TickOnce to complete, then use its trigger time.
-		// This guarantees anchorTime falls exactly on the Aggregator's tick boundary.
-		pd.aggregator.WaitForTick()
-		anchorTime = pd.aggregator.GetLastTickTime()
-		pd.logger.Info("pseudo driver: anchored to TickOnce trigger time",
+	case urrTime := <-pd.FirstURRSignal:
+		pd.logger.Info("pseudo driver: first URR received, anchoring timeline instantly")
+		// FIX: Do NOT wait for TickOnce to complete. If we wait, we miss the current tick
+		// and fall 5 seconds (one period) behind the Kernel's real-time reporting.
+		// By anchoring immediately using the exact time Kernel pushed its first report,
+		// we guarantee Phase 1 and Phase 2's first window enter the buffer BEFORE the
+		// Aggregator's TickOnce fires.
+		anchorTime = urrTime.Round(time.Second) // Align to clean second boundary
+		pd.logger.Info("pseudo driver: anchored to Kernel URR time",
 			zap.Time("anchorTime", anchorTime),
 		)
 	case <-time.After(urrWaitTimeout):
@@ -260,10 +262,26 @@ func (pd *PseudoDriver) LoadAndReplay(sub *Subscription) {
 		)
 	}
 
-	// Absolute reference time for Parquet offset 0
-	// alignedBreakingTime corresponds to the Anchor.
-	// So 0 corresponds to Anchor - alignedBreakingTime
-	referenceTime := anchorTime.Add(-time.Duration(alignedBreakingTime * float64(time.Second)))
+	// Find the true maximum globalTS in phase 1 to determine the exact end of our historical data
+	var actualEndWIdx int
+	if len(phase1Packets) > 0 {
+		maxP1TS := 0.0
+		for _, pkt := range phase1Packets {
+			if pkt.timestamp > maxP1TS {
+				maxP1TS = pkt.timestamp
+			}
+		}
+		actualEndWIdx = int(math.Floor(maxP1TS / period))
+	} else {
+		actualEndWIdx = int(math.Floor(alignedBreakingTime/period)) - 1
+	}
+
+	// NEW: Dynamic Tail Alignment
+	// We mathematically force the StartTime of the LAST populated Phase 1 window (`actualEndWIdx`)
+	// to perfectly align with the StartTime of the First Kernel URR (which is `anchorTime - period`).
+	// StartTime(actualEndWIdx) = referenceTime + actualEndWIdx * period  =>  must equal  (anchorTime - period).
+	// Therefore: referenceTime = anchorTime - (actualEndWIdx + 1) * period
+	referenceTime := anchorTime.Add(-time.Duration((actualEndWIdx+1)*periodSec) * time.Second)
 
 	// CRITICAL: Set the subscription's GridAnchor to our referenceTime.
 	// This is the SINGLE SOURCE OF TRUTH for the entire time grid.
@@ -301,15 +319,15 @@ func (pd *PseudoDriver) LoadAndReplay(sub *Subscription) {
 	pd.simMu.Lock()
 	pd.isSimulating = true
 	// Establish the first window of Phase 2 for Kernel snapping
-	startWIdx := int(alignedBreakingTime / period)
+	// startWIdx is the index immediately following Phase 1
+	startWIdx := actualEndWIdx + 1
 	firstP2Start := referenceTime.Add(time.Duration(float64(startWIdx)*period) * time.Second)
 	pd.phase2StartTime = firstP2Start
 	pd.phase2EndTime = firstP2Start.Add(time.Duration(periodSec) * time.Second)
 	pd.simMu.Unlock()
 
 	if len(phase1Packets) > 0 {
-		endWIdx := int(alignedBreakingTime/period) - 1
-		windows := pd.aggregateIntoWindows(phase1Packets, periodSec, referenceTime, endWIdx)
+		windows := pd.aggregateIntoWindows(phase1Packets, periodSec, referenceTime, actualEndWIdx)
 		for wIdx, measures := range windows {
 			logicalTime := referenceTime.Add(time.Duration((wIdx+1)*periodSec) * time.Second)
 			if pd.aggregator != nil {
@@ -326,7 +344,6 @@ func (pd *PseudoDriver) LoadAndReplay(sub *Subscription) {
 	// PHASE 2: Parallel Future Simulation (Synchronized pacing)
 	// =====================================================================
 	if len(phase2Windows) > 0 && pd.aggregator != nil {
-		startWIdx := int(alignedBreakingTime / period)
 		pd.simulateFutureRealTime(sub, phase2Windows, startWIdx)
 	}
 }
@@ -551,10 +568,36 @@ func (pd *PseudoDriver) simulateFutureRealTime(sub *Subscription, windows [][]Us
 
 	// STAGE 2: AGGREGATOR-SYNCHRONIZED PACING.
 	// We iterate through pre-computed windows starting from the first live index.
+	//
+	// CRITICAL FIX: The loop order is "Wait → Push" (not "Push → Wait").
+	// Rationale:
+	//   After TickOnce[N-1] fires, BOTH Phase 2 and Kernel push data for window N
+	//   into the buffer over the next ~5 seconds. Then TickOnce[N] fires and
+	//   collects them together in one consolidated notification.
+	//
+	//   If we used "Push → Wait", Phase 2 would push window N+1's empty padding
+	//   immediately after TickOnce[N], but Kernel's real data for N+1 wouldn't
+	//   arrive until the NEXT Kernel timer fires (~5s later). So Phase 2's empty
+	//   padding would go out in TickOnce[N+1] while Kernel's real data would only
+	//   appear in TickOnce[N+2] — permanently out of sync by one period.
 	for i := startWIdx; i < len(windows); i++ {
 		winMeasures := windows[i]
 
-		// 1. Push this window's data into Buffer FIRST.
+		// 1. Publish current Phase 2 window time for Kernel report alignment.
+		if len(winMeasures) > 0 {
+			pd.simMu.Lock()
+			pd.phase2StartTime = winMeasures[0].StartTime
+			pd.phase2EndTime = winMeasures[0].EndTime
+			pd.simMu.Unlock()
+		}
+
+		// 2. Wait for TickOnce[N-1] to finish first.
+		//    This ensures we don't push window N's data prematurely.
+		pd.aggregator.WaitForTick()
+
+		// 3. NOW push this window's data into Buffer.
+		//    Kernel's data for this same window will arrive over the next ~5s.
+		//    Both will be collected together by TickOnce[N].
 		if len(winMeasures) > 0 && pd.aggregator != nil {
 			pd.logger.Debug("pseudo driver: pushing Phase 2 data",
 				zap.Int("windowIndex", i),
@@ -563,17 +606,6 @@ func (pd *PseudoDriver) simulateFutureRealTime(sub *Subscription, windows [][]Us
 			)
 			pd.aggregator.PushLiveMeasures(sub, winMeasures)
 		}
-
-		// 2. Publish current Phase 2 window time for Kernel report alignment.
-		if len(winMeasures) > 0 {
-			pd.simMu.Lock()
-			pd.phase2StartTime = winMeasures[0].StartTime
-			pd.phase2EndTime = winMeasures[0].EndTime
-			pd.simMu.Unlock()
-		}
-
-		// 3. Wait for TickOnce to collect Phase2[N] + Kernel[N] together.
-		pd.aggregator.WaitForTick()
 	}
 
 	pd.logger.Info("pseudo driver: Phase 2 future simulation completed")

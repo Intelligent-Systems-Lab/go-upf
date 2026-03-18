@@ -62,6 +62,12 @@ type Aggregator struct {
 	firstURRReceived bool // Marks if the first real Kernel URR has arrived
 	startMu          sync.Mutex
 
+	// Signal-driven TickOnce: PushReport sends this after buffering Kernel data.
+	// Run loop waits for this signal (or a safety timeout) instead of a fixed sleep,
+	// ensuring TickOnce fires immediately after the CURRENT period's Kernel data
+	// arrives, without waiting so long that the NEXT period's data sneaks in.
+	kernelReady chan struct{}
+
 	// [Legacy] State cache: kept for delta computation if needed
 	// Key: SessionKey, Value: Last Counters
 	lastSnapshot map[SessionKey]Counters
@@ -94,6 +100,9 @@ func NewAggregator(
 
 		// Initialize ticker reset channel
 		tickerReset: make(chan struct{}, 1),
+
+		// Initialize kernel-ready signal channel (buffered=1 to avoid blocking PushReport)
+		kernelReady: make(chan struct{}, 1),
 
 		// Initialize shared ticker synchronization channel
 		tickDone: make(chan struct{}, 1),
@@ -144,11 +153,23 @@ func (aggregator *Aggregator) Run(parentContext context.Context) {
 				aggregator.logger.Info("ees ticker reset signal received, recreating ticker")
 				break tickerLoop
 			case <-tickerC:
-				// Wait 500ms to allow 'perio' ticker (which fires simultaneously)
-				// to fetch Kernel reports and push them into our buffer.
-				// 500ms is much safer than 100ms to handle system scheduling
-				// jitter and avoid Kernel reports "missing the boat".
-				time.Sleep(500 * time.Millisecond)
+				// SIGNAL-DRIVEN WAIT (Solution B):
+				// Instead of a fixed sleep, we wait for PushReport to signal that
+				// the CURRENT period's Kernel data has arrived. This ensures we
+				// fire TickOnce as soon as the data is ready, without waiting so
+				// long that the NEXT period's URR sneaks into the buffer.
+				//
+				// Safety timeout (2s) handles edge cases:
+				// - No active Kernel sessions (pure Pseudo mode)
+				// - PushReport signal lost due to race condition
+				select {
+				case <-aggregator.kernelReady:
+					// Small buffer to let all sessions' PushReport complete
+					time.Sleep(50 * time.Millisecond)
+					aggregator.logger.Debug("ees kernel-ready signal received, proceeding to TickOnce")
+				case <-time.After(2 * time.Second):
+					aggregator.logger.Debug("ees kernel-ready timeout, proceeding to TickOnce")
+				}
 
 				// Record tick time BEFORE processing
 				// CRITICAL FIX: time.Now() has millisecond/microsecond jitter (e.g. .663Z).
@@ -617,17 +638,21 @@ func (aggregator *Aggregator) PushReport(sessRpt report.SessReport) {
 	}
 	computeThroughputIfPossible(&m)
 
-	// Anchoring: Signal the PseudoDriver that the first real URR has arrived.
-	// We use m.EndTime (which is basically Now) to align history seamlessly to the present.
-	if aggregator.pseudoDriver != nil {
-		aggregator.pseudoDriver.SignalFirstURR(m.EndTime)
-	}
-
 	// Match to subscriptions by target scope
 	subscriptions := aggregator.subscriptionStore.AllSubscriptions()
 	for _, sub := range subscriptions {
 		if !aggregator.matchesSubscription(sub, ueIpv4Addr) {
 			continue
+		}
+
+		// Anchoring: Signal the PseudoDriver that the first real URR has arrived.
+		// We use time.Now() (NOT m.EndTime!) because m.EndTime reflects the Kernel's
+		// perio timer fire time. Passing time.Now() ensures the Phase 2 grid aligns
+		// perfectly with the CURRENT moment.
+		// CRITICAL: MUST BE INSIDE THE SUBSCRIPTION LOOP so we don't prematurely
+		// signal the PseudoDriver before a subscription is even active!
+		if aggregator.pseudoDriver != nil {
+			aggregator.pseudoDriver.SignalFirstURR(time.Now())
 		}
 
 		if sub.GridAnchor.IsZero() {
@@ -675,6 +700,13 @@ func (aggregator *Aggregator) PushReport(sessRpt report.SessReport) {
 			zap.Int("urrCount", reportCount),
 			zap.Uint32s("urrIDs", urrIDs),
 		)
+
+		// Signal the Run loop that Kernel data is ready.
+		// Non-blocking: if the channel already has a signal, skip.
+		select {
+		case aggregator.kernelReady <- struct{}{}:
+		default:
+		}
 	}
 }
 
