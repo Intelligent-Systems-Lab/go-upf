@@ -262,26 +262,10 @@ func (pd *PseudoDriver) LoadAndReplay(sub *Subscription) {
 		)
 	}
 
-	// Find the true maximum globalTS in phase 1 to determine the exact end of our historical data
-	var actualEndWIdx int
-	if len(phase1Packets) > 0 {
-		maxP1TS := 0.0
-		for _, pkt := range phase1Packets {
-			if pkt.timestamp > maxP1TS {
-				maxP1TS = pkt.timestamp
-			}
-		}
-		actualEndWIdx = int(math.Floor(maxP1TS / period))
-	} else {
-		actualEndWIdx = int(math.Floor(alignedBreakingTime/period)) - 1
-	}
-
-	// NEW: Dynamic Tail Alignment
-	// We mathematically force the StartTime of the LAST populated Phase 1 window (`actualEndWIdx`)
-	// to perfectly align with the StartTime of the First Kernel URR (which is `anchorTime - period`).
-	// StartTime(actualEndWIdx) = referenceTime + actualEndWIdx * period  =>  must equal  (anchorTime - period).
-	// Therefore: referenceTime = anchorTime - (actualEndWIdx + 1) * period
-	referenceTime := anchorTime.Add(-time.Duration((actualEndWIdx+1)*periodSec) * time.Second)
+	// Absolute reference time for Parquet offset 0
+	// alignedBreakingTime corresponds to the Anchor.
+	// So offset 0 corresponds to Anchor - alignedBreakingTime
+	referenceTime := anchorTime.Add(-time.Duration(alignedBreakingTime * float64(time.Second)))
 
 	// CRITICAL: Set the subscription's GridAnchor to our referenceTime.
 	// This is the SINGLE SOURCE OF TRUTH for the entire time grid.
@@ -319,15 +303,15 @@ func (pd *PseudoDriver) LoadAndReplay(sub *Subscription) {
 	pd.simMu.Lock()
 	pd.isSimulating = true
 	// Establish the first window of Phase 2 for Kernel snapping
-	// startWIdx is the index immediately following Phase 1
-	startWIdx := actualEndWIdx + 1
+	startWIdx := int(alignedBreakingTime / period)
 	firstP2Start := referenceTime.Add(time.Duration(float64(startWIdx)*period) * time.Second)
 	pd.phase2StartTime = firstP2Start
 	pd.phase2EndTime = firstP2Start.Add(time.Duration(periodSec) * time.Second)
 	pd.simMu.Unlock()
 
 	if len(phase1Packets) > 0 {
-		windows := pd.aggregateIntoWindows(phase1Packets, periodSec, referenceTime, actualEndWIdx)
+		endWIdx := int(alignedBreakingTime/period) - 1
+		windows := pd.aggregateIntoWindows(phase1Packets, periodSec, referenceTime, endWIdx)
 		for wIdx, measures := range windows {
 			logicalTime := referenceTime.Add(time.Duration((wIdx+1)*periodSec) * time.Second)
 			if pd.aggregator != nil {
