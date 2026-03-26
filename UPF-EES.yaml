@@ -34,3 +34,4 @@ ees:
   listenAddr: "127.0.0.1:8088"
   periodSec: 10
   logLevel: "debug"
+  parquetDir: "pre_data/group1"
