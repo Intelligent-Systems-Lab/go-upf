@@ -687,7 +687,24 @@ func (aggregator *Aggregator) PushReport(sessRpt report.SessReport) {
 		// Buffer everything directly; TickOnce will snap it
 		aggregator.mu.Lock()
 		aggregator.reportBuffer[sub.ID] = append(aggregator.reportBuffer[sub.ID], m)
+		bufLen := len(aggregator.reportBuffer[sub.ID])
 		aggregator.mu.Unlock()
+
+		// DEBUG: Log Phase 2 alignment state when Kernel report arrives during simulation
+		if aggregator.pseudoDriver != nil {
+			p2Start, p2End, simActive := aggregator.pseudoDriver.GetPhase2Window()
+			aggregator.logger.Info("ees PushReport: Kernel report buffered during pseudo mode",
+				zap.String("subscriptionId", sub.ID),
+				zap.Bool("phase2Active", simActive),
+				zap.Time("kernelStartTime", m.StartTime),
+				zap.Time("kernelEndTime", m.EndTime),
+				zap.Time("phase2WindowStart", p2Start),
+				zap.Time("phase2WindowEnd", p2End),
+				zap.Time("gridAnchor", sub.GridAnchor),
+				zap.Int("bufferSizeAfterPush", bufLen),
+				zap.Time("wallClockNow", time.Now()),
+			)
+		}
 
 		aggregator.logger.Info("ees smf urr report captured",
 			zap.String("subscriptionId", sub.ID),
@@ -809,4 +826,33 @@ func (aggregator *Aggregator) AdjustReportPeriod(urrPeriod time.Duration) bool {
 	}
 
 	return true
+}
+
+// DebugDumpBufferState logs a snapshot of the current reportBuffer for debugging.
+// Called by PseudoDriver at transition points to understand what data is queued.
+func (aggregator *Aggregator) DebugDumpBufferState(label string) {
+	aggregator.mu.Lock()
+	defer aggregator.mu.Unlock()
+
+	if len(aggregator.reportBuffer) == 0 {
+		aggregator.logger.Info("ees DebugDumpBufferState: buffer is empty",
+			zap.String("label", label),
+		)
+		return
+	}
+
+	for subID, measures := range aggregator.reportBuffer {
+		for i, m := range measures {
+			aggregator.logger.Info("ees DebugDumpBufferState: entry",
+				zap.String("label", label),
+				zap.String("subscriptionId", subID),
+				zap.Int("index", i),
+				zap.Time("startTime", m.StartTime),
+				zap.Time("endTime", m.EndTime),
+				zap.String("ueIp", m.UeIpv4Addr),
+				zap.Uint64("ulBytes", m.ULBytesDelta),
+				zap.Uint64("dlBytes", m.DLBytesDelta),
+			)
+		}
+	}
 }

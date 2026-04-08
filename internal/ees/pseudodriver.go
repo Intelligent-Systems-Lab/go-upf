@@ -325,6 +325,24 @@ func (pd *PseudoDriver) LoadAndReplay(sub *Subscription) {
 	}
 
 	// =====================================================================
+	// DEBUG: Phase 1 → Phase 2 transition state dump
+	// =====================================================================
+	pd.logger.Info("pseudo driver: === PHASE TRANSITION 1→2 STATE DUMP ===",
+		zap.Time("anchorTime", anchorTime),
+		zap.Time("gridAnchor", sub.GridAnchor),
+		zap.Time("lastNotify", sub.LastNotify),
+		zap.Float64("alignedBreakingTimeSec", alignedBreakingTime),
+		zap.Int("phase1PacketCount", len(phase1Packets)),
+		zap.Int("phase2PacketCount", len(phase2Packets)),
+		zap.Int("phase2WindowCount", len(phase2Windows)),
+		zap.Int("startWIdx", startWIdx),
+		zap.Bool("isSimulating", pd.isSimulating),
+		zap.Time("phase2StartTime", pd.phase2StartTime),
+		zap.Time("phase2EndTime", pd.phase2EndTime),
+		zap.Time("wallClockNow", time.Now()),
+	)
+
+	// =====================================================================
 	// PHASE 2: Parallel Future Simulation (Synchronized pacing)
 	// =====================================================================
 	if len(phase2Windows) > 0 && pd.aggregator != nil {
@@ -550,6 +568,9 @@ func (pd *PseudoDriver) simulateFutureRealTime(sub *Subscription, windows [][]Us
 	// Clean up any stale signals accumulated during history replay.
 	pd.aggregator.DrainTickDone()
 
+	// DEBUG: Dump Aggregator buffer state at Phase 2 entry
+	pd.aggregator.DebugDumpBufferState("Phase2-Entry")
+
 	// STAGE 2: AGGREGATOR-SYNCHRONIZED PACING.
 	// We iterate through pre-computed windows starting from the first live index.
 	//
@@ -570,23 +591,45 @@ func (pd *PseudoDriver) simulateFutureRealTime(sub *Subscription, windows [][]Us
 		// 1. Publish current Phase 2 window time for Kernel report alignment.
 		if len(winMeasures) > 0 {
 			pd.simMu.Lock()
+			oldP2Start := pd.phase2StartTime
+			oldP2End := pd.phase2EndTime
 			pd.phase2StartTime = winMeasures[0].StartTime
 			pd.phase2EndTime = winMeasures[0].EndTime
 			pd.simMu.Unlock()
+
+			pd.logger.Info("pseudo driver: Phase 2 window published",
+				zap.Int("windowIndex", i),
+				zap.Time("newP2Start", winMeasures[0].StartTime),
+				zap.Time("newP2End", winMeasures[0].EndTime),
+				zap.Time("prevP2Start", oldP2Start),
+				zap.Time("prevP2End", oldP2End),
+				zap.Time("wallClockNow", time.Now()),
+			)
 		}
 
 		// 2. Wait for TickOnce[N-1] to finish first.
 		//    This ensures we don't push window N's data prematurely.
+		waitStart := time.Now()
 		pd.aggregator.WaitForTick()
+		waitDuration := time.Since(waitStart)
+
+		pd.logger.Info("pseudo driver: Phase 2 WaitForTick returned",
+			zap.Int("windowIndex", i),
+			zap.Duration("waitDuration", waitDuration),
+			zap.Time("wallClockNow", time.Now()),
+			zap.Time("aggLastTickTime", pd.aggregator.GetLastTickTime()),
+		)
 
 		// 3. NOW push this window's data into Buffer.
 		//    Kernel's data for this same window will arrive over the next ~5s.
 		//    Both will be collected together by TickOnce[N].
 		if len(winMeasures) > 0 && pd.aggregator != nil {
-			pd.logger.Debug("pseudo driver: pushing Phase 2 data",
+			pd.logger.Info("pseudo driver: pushing Phase 2 data",
 				zap.Int("windowIndex", i),
 				zap.Int("measures", len(winMeasures)),
-				zap.Time("startTime", winMeasures[0].StartTime),
+				zap.Time("dataStartTime", winMeasures[0].StartTime),
+				zap.Time("dataEndTime", winMeasures[0].EndTime),
+				zap.Time("wallClockNow", time.Now()),
 			)
 			pd.aggregator.PushLiveMeasures(sub, winMeasures)
 		}
