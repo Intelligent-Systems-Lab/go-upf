@@ -120,6 +120,43 @@ type windowKey struct {
 	windowIndex int
 }
 
+// counterAccum holds accumulated counters for a single (ueIP, windowIndex) pair.
+type counterAccum struct {
+	ulBytes   uint64
+	dlBytes   uint64
+	ulPkts    uint64
+	dlPkts    uint64
+	startTime float64
+	endTime   float64
+}
+
+// accumulatePacket adds a parsed packet's data to the corresponding counter in the map.
+func accumulatePacket(accum map[windowKey]*counterAccum, key windowKey, pkt parsedPacket) {
+	ca, ok := accum[key]
+	if !ok {
+		ca = &counterAccum{
+			startTime: pkt.timestamp,
+			endTime:   pkt.timestamp,
+		}
+		accum[key] = ca
+	}
+
+	if pkt.isUplink {
+		ca.ulBytes += pkt.pktLen
+		ca.ulPkts++
+	} else {
+		ca.dlBytes += pkt.pktLen
+		ca.dlPkts++
+	}
+
+	if pkt.timestamp < ca.startTime {
+		ca.startTime = pkt.timestamp
+	}
+	if pkt.timestamp > ca.endTime {
+		ca.endTime = pkt.timestamp
+	}
+}
+
 // LoadAndReplay reads the Parquet files from directory chronologically,
 // aggregates packets into corresponding continuous time windows,
 // and sends them as EES notifications to the given subscription.
@@ -191,48 +228,43 @@ func (pd *PseudoDriver) LoadAndReplay(sub *Subscription) {
 	alignedBreakingTime := math.Ceil(breakingTimeSec/period) * period
 
 	// =====================================================================
-	// PRE-READ ALL PARQUET FILES (SLOW IO OPERATION)
-	// We MUST do this BEFORE waiting for URR/anchorTime to avoid missing
-	// the Aggregator's Ticker heartbeat during the multi-second load time.
+	// STREAMING AGGREGATION (Memory-efficient)
+	// Instead of storing all parsed packets in memory, we read each file
+	// and directly accumulate into counterAccum maps. This reduces peak
+	// memory from O(total_packets) to O(unique_UEs × unique_windows).
 	// =====================================================================
-	pd.logger.Info("pseudo driver: pre-reading and filtering parquet files")
-	var phase1Packets []parsedPacket
-	var phase2Packets []parsedPacket
+	pd.logger.Info("pseudo driver: streaming parquet files into aggregation maps")
+	phase1Accum := make(map[windowKey]*counterAccum)
+	phase2Accum := make(map[windowKey]*counterAccum)
+	uniqueUEs := make(map[string]bool)
 	globalTimeOffset := 0.0
+	var phase1PktCount, phase2PktCount int
 
 	for _, fileObj := range files {
-		packets, readErr := pd.readParquetFile(fileObj)
-		if readErr != nil || len(packets) == 0 {
-			continue
-		}
-		filtered := pd.filterBySubscription(packets, sub)
-		if len(filtered) == 0 {
+		// Pass 1: Scan for min/max timestamps without storing any rows
+		minTS, maxTS, rowCount, scanErr := pd.scanTimestampRange(fileObj, sub)
+		if scanErr != nil || rowCount == 0 {
 			continue
 		}
 
-		minTS := filtered[0].timestamp
-		maxTS := filtered[0].timestamp
-		for _, pkt := range filtered[1:] {
-			if pkt.timestamp < minTS {
-				minTS = pkt.timestamp
-			}
-			if pkt.timestamp > maxTS {
-				maxTS = pkt.timestamp
-			}
-		}
-
-		// Adjust timestamps to unified global timeline
-		for i := range filtered {
-			globalTS := (filtered[i].timestamp - minTS) + globalTimeOffset
-			filtered[i].timestamp = globalTS
-			if globalTS <= alignedBreakingTime {
-				phase1Packets = append(phase1Packets, filtered[i])
-			} else {
-				phase2Packets = append(phase2Packets, filtered[i])
-			}
-		}
+		// Pass 2: Re-read file, process each row directly into accum maps
+		p1, p2 := pd.streamAndAccumulate(
+			fileObj, sub, minTS, globalTimeOffset,
+			alignedBreakingTime, period,
+			phase1Accum, phase2Accum, uniqueUEs,
+		)
+		phase1PktCount += p1
+		phase2PktCount += p2
 		globalTimeOffset += (maxTS - minTS) + 0.001
 	}
+
+	pd.logger.Info("pseudo driver: streaming aggregation complete",
+		zap.Int("phase1Entries", len(phase1Accum)),
+		zap.Int("phase2Entries", len(phase2Accum)),
+		zap.Int("phase1Packets", phase1PktCount),
+		zap.Int("phase2Packets", phase2PktCount),
+		zap.Int("uniqueUEs", len(uniqueUEs)),
+	)
 
 	// Wait for the first URR report from the kernel, then anchor to the
 	// NEXT TickOnce trigger time. This aligns the entire time grid to the
@@ -277,26 +309,25 @@ func (pd *PseudoDriver) LoadAndReplay(sub *Subscription) {
 	)
 
 	// =====================================================================
-	// 5. [NEW] PRE-COMPUTE all Phase 2 window data upfront.
-	// This ensures the transition from History to Live is instant.
+	// 5. Build Phase 2 windows from pre-aggregated accum map.
 	// =====================================================================
 	var phase2Windows [][]UsageMeasures
-	if len(phase2Packets) > 0 {
-		maxP2TS := 0.0
-		for _, pkt := range phase2Packets {
-			if pkt.timestamp > maxP2TS {
-				maxP2TS = pkt.timestamp
+	if len(phase2Accum) > 0 {
+		endP2WIdx := 0
+		for key := range phase2Accum {
+			if key.windowIndex > endP2WIdx {
+				endP2WIdx = key.windowIndex
 			}
 		}
-		endP2WIdx := int(math.Floor(maxP2TS / period))
-		phase2Windows = pd.aggregateIntoWindows(phase2Packets, periodSec, referenceTime, endP2WIdx)
+		phase2Windows = pd.buildWindowsFromAccum(phase2Accum, uniqueUEs, periodSec, referenceTime, endP2WIdx)
+		phase2Accum = nil // Allow GC to reclaim
 	}
 
 	// =====================================================================
 	// PHASE 1: Warmstart (Historical Burst - Near Instant)
 	// =====================================================================
 	pd.logger.Info("pseudo driver: executing Phase 1 (Warmstart)",
-		zap.Int("packets", len(phase1Packets)),
+		zap.Int("packets", phase1PktCount),
 	)
 
 	// Pre-activate simulation state so Kernel reports align to GridAnchor immediately.
@@ -309,9 +340,10 @@ func (pd *PseudoDriver) LoadAndReplay(sub *Subscription) {
 	pd.phase2EndTime = firstP2Start.Add(time.Duration(periodSec) * time.Second)
 	pd.simMu.Unlock()
 
-	if len(phase1Packets) > 0 {
+	if len(phase1Accum) > 0 {
 		endWIdx := int(alignedBreakingTime/period) - 1
-		windows := pd.aggregateIntoWindows(phase1Packets, periodSec, referenceTime, endWIdx)
+		windows := pd.buildWindowsFromAccum(phase1Accum, uniqueUEs, periodSec, referenceTime, endWIdx)
+		phase1Accum = nil // Allow GC to reclaim
 		for wIdx, measures := range windows {
 			logicalTime := referenceTime.Add(time.Duration((wIdx+1)*periodSec) * time.Second)
 			if pd.aggregator != nil {
@@ -332,8 +364,8 @@ func (pd *PseudoDriver) LoadAndReplay(sub *Subscription) {
 		zap.Time("gridAnchor", sub.GridAnchor),
 		zap.Time("lastNotify", sub.LastNotify),
 		zap.Float64("alignedBreakingTimeSec", alignedBreakingTime),
-		zap.Int("phase1PacketCount", len(phase1Packets)),
-		zap.Int("phase2PacketCount", len(phase2Packets)),
+		zap.Int("phase1PacketCount", phase1PktCount),
+		zap.Int("phase2PacketCount", phase2PktCount),
 		zap.Int("phase2WindowCount", len(phase2Windows)),
 		zap.Int("startWIdx", startWIdx),
 		zap.Bool("isSimulating", pd.isSimulating),
@@ -350,151 +382,141 @@ func (pd *PseudoDriver) LoadAndReplay(sub *Subscription) {
 	}
 }
 
-// readParquetFile reads all rows from the specified Parquet file and converts to parsedPacket.
-func (pd *PseudoDriver) readParquetFile(filePath string) ([]parsedPacket, error) {
+// matchesSubscriptionFilter checks if a UE IP matches the subscription's target scope.
+func matchesSubscriptionFilter(sub *Subscription, ueIP string) bool {
+	if sub.Target.AnyUE {
+		return true
+	}
+	return sub.Target.UeIPAddress != "" && sub.Target.UeIPAddress == ueIP
+}
+
+// scanTimestampRange reads through a Parquet file to find the min/max timestamps
+// of rows matching the subscription filter. No row data is stored in memory.
+func (pd *PseudoDriver) scanTimestampRange(filePath string, sub *Subscription) (minTS, maxTS float64, rowCount int, err error) {
 	f, err := os.Open(filePath)
 	if err != nil {
-		return nil, fmt.Errorf("open parquet file: %w", err)
+		return 0, 0, 0, fmt.Errorf("open parquet file: %w", err)
 	}
 	defer f.Close()
 
 	reader := parquet.NewReader(f)
 	defer reader.Close()
 
-	var packets []parsedPacket
-	parseErrors := 0
+	first := true
+	for {
+		var row ParquetRow
+		if readErr := reader.Read(&row); readErr != nil {
+			break
+		}
+		if row.UeIP == "" {
+			continue
+		}
+		if !matchesSubscriptionFilter(sub, row.UeIP) {
+			continue
+		}
+
+		if first {
+			minTS = row.Timestamp
+			maxTS = row.Timestamp
+			first = false
+		} else {
+			if row.Timestamp < minTS {
+				minTS = row.Timestamp
+			}
+			if row.Timestamp > maxTS {
+				maxTS = row.Timestamp
+			}
+		}
+		rowCount++
+	}
+	return
+}
+
+// streamAndAccumulate re-reads a Parquet file and accumulates each matching row
+// directly into the phase1/phase2 accum maps. No intermediate slice is created.
+func (pd *PseudoDriver) streamAndAccumulate(
+	filePath string, sub *Subscription,
+	minTS, globalTimeOffset, alignedBreakingTime, period float64,
+	phase1Accum, phase2Accum map[windowKey]*counterAccum,
+	uniqueUEs map[string]bool,
+) (phase1Count, phase2Count int) {
+	f, err := os.Open(filePath)
+	if err != nil {
+		pd.logger.Error("pseudo driver: failed to re-open parquet file",
+			zap.String("file", filePath), zap.Error(err))
+		return
+	}
+	defer f.Close()
+
+	reader := parquet.NewReader(f)
+	defer reader.Close()
 
 	for {
 		var row ParquetRow
-		err := reader.Read(&row)
-		if err != nil {
-			break // EOF or error
+		if readErr := reader.Read(&row); readErr != nil {
+			break
 		}
-
-		pkt, parseErr := parseRow(row)
-		if parseErr != nil {
-			parseErrors++
+		if row.UeIP == "" {
 			continue
 		}
-		packets = append(packets, pkt)
-	}
+		if !matchesSubscriptionFilter(sub, row.UeIP) {
+			continue
+		}
 
-	if parseErrors > 0 {
-		pd.logger.Warn("pseudo driver: some rows failed to parse",
-			zap.String("file", filePath),
-			zap.Int("parseErrors", parseErrors),
-			zap.Int("successfulRows", len(packets)),
-		)
-	}
+		globalTS := (row.Timestamp - minTS) + globalTimeOffset
+		wIdx := int(math.Floor(globalTS / period))
+		key := windowKey{ueIP: row.UeIP, windowIndex: wIdx}
+		uniqueUEs[row.UeIP] = true
 
-	return packets, nil
-}
+		pkt := parsedPacket{
+			ueIP:      row.UeIP,
+			timestamp: globalTS,
+			pktLen:    uint64(row.Len),
+			isUplink:  row.Direction == "0",
+		}
 
-// parseRow converts a ParquetRow to a parsedPacket.
-func parseRow(row ParquetRow) (parsedPacket, error) {
-	if row.UeIP == "" {
-		return parsedPacket{}, fmt.Errorf("skip empty row")
-	}
-
-	isUplink := row.Direction == "0"
-
-	return parsedPacket{
-		ueIP:      row.UeIP,
-		timestamp: row.Timestamp,
-		pktLen:    uint64(row.Len),
-		isUplink:  isUplink,
-	}, nil
-}
-
-// filterBySubscription filters packets based on the subscription's target scope.
-func (pd *PseudoDriver) filterBySubscription(packets []parsedPacket, sub *Subscription) []parsedPacket {
-	if sub.Target.AnyUE {
-		return packets // no filtering needed
-	}
-
-	if sub.Target.UeIPAddress == "" {
-		return nil
-	}
-
-	filtered := make([]parsedPacket, 0, len(packets)/2)
-	for _, pkt := range packets {
-		if pkt.ueIP == sub.Target.UeIPAddress {
-			filtered = append(filtered, pkt)
+		if globalTS <= alignedBreakingTime {
+			accumulatePacket(phase1Accum, key, pkt)
+			phase1Count++
+		} else {
+			accumulatePacket(phase2Accum, key, pkt)
+			phase2Count++
 		}
 	}
-	return filtered
+	return
 }
 
-// aggregateIntoWindows groups packets into time windows and produces
-// a slice of []UsageMeasures for each window, ordered by time.
-// Since timestamps are already shifted, window indices naturally align globally.
-func (pd *PseudoDriver) aggregateIntoWindows(packets []parsedPacket, periodSec int, referenceTime time.Time, endWindowIndex int) [][]UsageMeasures {
-	if len(packets) == 0 {
+// buildWindowsFromAccum converts a pre-built counterAccum map into ordered [][]UsageMeasures.
+// This replaces aggregateIntoWindows: instead of iterating over raw packets to build
+// the accum map internally, it accepts an already-built map from streaming aggregation.
+func (pd *PseudoDriver) buildWindowsFromAccum(
+	accum map[windowKey]*counterAccum,
+	uniqueUEs map[string]bool,
+	periodSec int,
+	referenceTime time.Time,
+	endWindowIndex int,
+) [][]UsageMeasures {
+	if len(accum) == 0 {
 		return nil
 	}
 
 	period := float64(periodSec)
 
-	// Build aggregation map: windowKey -> accumulated counters
-	type counterAccum struct {
-		ulBytes   uint64
-		dlBytes   uint64
-		ulPkts    uint64
-		dlPkts    uint64
-		startTime float64
-		endTime   float64
-	}
-
-	accum := make(map[windowKey]*counterAccum)
-	uniqueUEs := make(map[string]bool)
+	// Determine actual max window index
 	maxWindowIndex := endWindowIndex
-
-	for _, pkt := range packets {
-		// global offset is 0-indexed across all files now
-		wIdx := int(math.Floor(pkt.timestamp / period))
-		if wIdx > maxWindowIndex {
-			maxWindowIndex = wIdx
-		}
-		uniqueUEs[pkt.ueIP] = true
-
-		key := windowKey{ueIP: pkt.ueIP, windowIndex: wIdx}
-
-		ca, ok := accum[key]
-		if !ok {
-			ca = &counterAccum{
-				startTime: pkt.timestamp,
-				endTime:   pkt.timestamp,
-			}
-			accum[key] = ca
-		}
-
-		if pkt.isUplink {
-			ca.ulBytes += pkt.pktLen
-			ca.ulPkts++
-		} else {
-			ca.dlBytes += pkt.pktLen
-			ca.dlPkts++
-		}
-
-		if pkt.timestamp < ca.startTime {
-			ca.startTime = pkt.timestamp
-		}
-		if pkt.timestamp > ca.endTime {
-			ca.endTime = pkt.timestamp
+	for key := range accum {
+		if key.windowIndex > maxWindowIndex {
+			maxWindowIndex = key.windowIndex
 		}
 	}
 
 	// Build output: one []UsageMeasures per window (may contain multiple UEs)
-	// For every window from 0 to maxWindowIndex, and every unique UE, we output a report.
 	windowResults := make(map[int][]UsageMeasures)
 
 	for wIdx := 0; wIdx <= maxWindowIndex; wIdx++ {
 		windowStartOff := float64(wIdx) * period
 		windowEndOff := windowStartOff + period
 
-		// Use integer conversion and truncate to Millisecond to completely eliminate
-		// float64 precision noise. This guarantees the generated time will perfectly
-		// match the snapTime() logic in the Aggregator.
 		offsetStart := time.Duration(math.Round(windowStartOff * float64(time.Second)))
 		offsetEnd := time.Duration(math.Round(windowEndOff * float64(time.Second)))
 
@@ -507,11 +529,8 @@ func (pd *PseudoDriver) aggregateIntoWindows(packets []parsedPacket, periodSec i
 
 			var m UsageMeasures
 			if exists {
-				// Align StartTime/EndTime to fixed window boundaries so that
-				// all UEs in the same notification share identical time ranges,
-				// matching the live UPF-EES behavior.
 				m = UsageMeasures{
-					Key:            SessionKey{LocalSEID: uint64(wIdx + 1)}, // pseudo SEID
+					Key:            SessionKey{LocalSEID: uint64(wIdx + 1)},
 					ULBytesDelta:   ca.ulBytes,
 					DLBytesDelta:   ca.dlBytes,
 					ULPacketsDelta: ca.ulPkts,
@@ -521,13 +540,8 @@ func (pd *PseudoDriver) aggregateIntoWindows(packets []parsedPacket, periodSec i
 					UeIpv4Addr:     ueIP,
 				}
 			} else {
-				// Pad with zero traffic if no packets appeared in this window
 				m = UsageMeasures{
 					Key:            SessionKey{LocalSEID: uint64(wIdx + 1)},
-					ULBytesDelta:   0,
-					DLBytesDelta:   0,
-					ULPacketsDelta: 0,
-					DLPacketsDelta: 0,
 					StartTime:      defaultStartT,
 					EndTime:        defaultEndT,
 					UeIpv4Addr:     ueIP,
