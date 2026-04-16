@@ -684,15 +684,15 @@ func (aggregator *Aggregator) PushReport(sessRpt report.SessReport) {
 			continue
 		}
 
-		// Buffer everything directly; TickOnce will snap it
-		aggregator.mu.Lock()
-		aggregator.reportBuffer[sub.ID] = append(aggregator.reportBuffer[sub.ID], m)
-		bufLen := len(aggregator.reportBuffer[sub.ID])
-		aggregator.mu.Unlock()
-
-		// DEBUG: Log Phase 2 alignment state when Kernel report arrives during simulation
+		// DEBUG: Log Phase 2 alignment state and rewrite timestamps BEFORE buffering
 		if aggregator.pseudoDriver != nil {
 			p2Start, p2End, simActive := aggregator.pseudoDriver.GetPhase2Window()
+			
+			if simActive {
+				m.StartTime = p2Start
+				m.EndTime = p2End
+			}
+			
 			aggregator.logger.Info("ees PushReport: Kernel report buffered during pseudo mode",
 				zap.String("subscriptionId", sub.ID),
 				zap.Bool("phase2Active", simActive),
@@ -701,10 +701,14 @@ func (aggregator *Aggregator) PushReport(sessRpt report.SessReport) {
 				zap.Time("phase2WindowStart", p2Start),
 				zap.Time("phase2WindowEnd", p2End),
 				zap.Time("gridAnchor", sub.GridAnchor),
-				zap.Int("bufferSizeAfterPush", bufLen),
 				zap.Time("wallClockNow", time.Now()),
 			)
 		}
+
+		// Buffer everything directly; TickOnce will snap it
+		aggregator.mu.Lock()
+		aggregator.reportBuffer[sub.ID] = append(aggregator.reportBuffer[sub.ID], m)
+		aggregator.mu.Unlock()
 
 		aggregator.logger.Info("ees smf urr report captured",
 			zap.String("subscriptionId", sub.ID),
