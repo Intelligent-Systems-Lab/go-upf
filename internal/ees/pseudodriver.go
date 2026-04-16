@@ -33,9 +33,10 @@ type PseudoDriver struct {
 
 	aggregator *Aggregator
 
-	// FirstURRSignal is signaled by the Aggregator when the first URR report arrives.
-	FirstURRSignal chan time.Time
-	firstURROnce   sync.Once
+	// First URR Signal synchronization: broadcast to ALL Phase 1 threads
+	firstURRReady chan struct{}
+	firstURRTime  time.Time
+	firstURROnce  sync.Once
 
 	// Phase 2 state: tracks the current simulation window so that
 	// Kernel reports can be aligned to the same time grid.
@@ -48,10 +49,10 @@ type PseudoDriver struct {
 // NewPseudoDriver constructs a PseudoDriver.
 func NewPseudoDriver(parquetDir string, notifier *Notifier, logger *zap.Logger) *PseudoDriver {
 	return &PseudoDriver{
-		parquetDir:     parquetDir,
-		notifier:       notifier,
-		logger:         logger,
-		FirstURRSignal: make(chan time.Time, 1),
+		parquetDir:    parquetDir,
+		notifier:      notifier,
+		logger:        logger,
+		firstURRReady: make(chan struct{}),
 	}
 }
 
@@ -70,8 +71,9 @@ func (pd *PseudoDriver) SignalFirstURR(urrStartTime time.Time) {
 		return
 	}
 	pd.firstURROnce.Do(func() {
-		pd.FirstURRSignal <- urrStartTime
-		pd.logger.Info("pseudo driver: first URR signal sent",
+		pd.firstURRTime = urrStartTime
+		close(pd.firstURRReady)
+		pd.logger.Info("pseudo driver: first URR signal broadcasted",
 			zap.Time("urrStartTime", urrStartTime),
 		)
 	})
@@ -276,7 +278,8 @@ func (pd *PseudoDriver) LoadAndReplay(sub *Subscription) {
 	)
 
 	select {
-	case urrTime := <-pd.FirstURRSignal:
+	case <-pd.firstURRReady:
+		urrTime := pd.firstURRTime
 		pd.logger.Info("pseudo driver: first URR received, anchoring timeline instantly")
 		// FIX: Do NOT wait for TickOnce to complete. If we wait, we miss the current tick
 		// and fall 5 seconds (one period) behind the Kernel's real-time reporting.
@@ -319,7 +322,7 @@ func (pd *PseudoDriver) LoadAndReplay(sub *Subscription) {
 				endP2WIdx = key.windowIndex
 			}
 		}
-		phase2Windows = pd.buildWindowsFromAccum(phase2Accum, uniqueUEs, periodSec, referenceTime, endP2WIdx)
+		phase2Windows = pd.buildWindowsFromAccum(sub, phase2Accum, uniqueUEs, periodSec, referenceTime, endP2WIdx)
 		phase2Accum = nil // Allow GC to reclaim
 	}
 
@@ -342,7 +345,7 @@ func (pd *PseudoDriver) LoadAndReplay(sub *Subscription) {
 
 	if len(phase1Accum) > 0 {
 		endWIdx := int(alignedBreakingTime/period) - 1
-		windows := pd.buildWindowsFromAccum(phase1Accum, uniqueUEs, periodSec, referenceTime, endWIdx)
+		windows := pd.buildWindowsFromAccum(sub, phase1Accum, uniqueUEs, periodSec, referenceTime, endWIdx)
 		phase1Accum = nil // Allow GC to reclaim
 		for wIdx, measures := range windows {
 			logicalTime := referenceTime.Add(time.Duration((wIdx+1)*periodSec) * time.Second)
@@ -490,6 +493,7 @@ func (pd *PseudoDriver) streamAndAccumulate(
 // This replaces aggregateIntoWindows: instead of iterating over raw packets to build
 // the accum map internally, it accepts an already-built map from streaming aggregation.
 func (pd *PseudoDriver) buildWindowsFromAccum(
+	sub *Subscription,
 	accum map[windowKey]*counterAccum,
 	uniqueUEs map[string]bool,
 	periodSec int,
