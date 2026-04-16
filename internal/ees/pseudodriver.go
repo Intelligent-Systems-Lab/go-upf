@@ -602,7 +602,14 @@ func (pd *PseudoDriver) simulateFutureRealTime(sub *Subscription, windows [][]Us
 	for i := startWIdx; i < len(windows); i++ {
 		winMeasures := windows[i]
 
-		// 1. Publish current Phase 2 window time for Kernel report alignment.
+		// 1. Wait for TickOnce[N-1] to finish first.
+		//    This marks the beginning of the ~5s interval leading up to TickOnce[N].
+		waitStart := time.Now()
+		pd.aggregator.WaitForTick()
+		waitDuration := time.Since(waitStart)
+
+		// 2. Publish current Phase 2 window time for Kernel report alignment.
+		//    Kernel reports arriving during the next ~5s wait will use THIS window.
 		if len(winMeasures) > 0 {
 			pd.simMu.Lock()
 			oldP2Start := pd.phase2StartTime
@@ -620,12 +627,6 @@ func (pd *PseudoDriver) simulateFutureRealTime(sub *Subscription, windows [][]Us
 				zap.Time("wallClockNow", time.Now()),
 			)
 		}
-
-		// 2. Wait for TickOnce[N-1] to finish first.
-		//    This ensures we don't push window N's data prematurely.
-		waitStart := time.Now()
-		pd.aggregator.WaitForTick()
-		waitDuration := time.Since(waitStart)
 
 		pd.logger.Info("pseudo driver: Phase 2 WaitForTick returned",
 			zap.Int("windowIndex", i),

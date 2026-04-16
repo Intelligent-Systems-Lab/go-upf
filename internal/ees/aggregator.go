@@ -695,6 +695,11 @@ func (aggregator *Aggregator) PushReport(sessRpt report.SessReport) {
 		if aggregator.pseudoDriver != nil {
 			p2Start, p2End, simActive := aggregator.pseudoDriver.GetPhase2Window()
 			
+			if simActive {
+				m.StartTime = p2Start
+				m.EndTime = p2End
+			}
+			
 			aggregator.logger.Info("ees PushReport: Kernel report buffered during pseudo mode",
 				zap.String("subscriptionId", sub.ID),
 				zap.Bool("phase2Active", simActive),
