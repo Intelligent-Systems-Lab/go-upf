@@ -665,8 +665,15 @@ func (aggregator *Aggregator) PushReport(sessRpt report.SessReport) {
 					zap.Time("gridAnchor", sub.GridAnchor),
 				)
 			} else {
-				aggregator.logger.Debug("ees skipping grid anchor set - PseudoDriver will set it",
+				// During testing (e.g. Daisy), subscriptions are created and destroyed dynamically
+				// mid-simulation. PseudoDriver cannot foresee this. So when the first Kernel 
+				// report arrives on a new sub during Phase 2, we must anchor it perfectly 
+				// to the Phase 2 mathematical grid.
+				_, p2End, _ := aggregator.pseudoDriver.GetPhase2Window()
+				sub.GridAnchor = p2End
+				aggregator.logger.Info("ees established grid anchor dynamically aligned with Phase 2",
 					zap.String("subscriptionId", sub.ID),
+					zap.Time("gridAnchor", sub.GridAnchor),
 				)
 			}
 		}
@@ -687,11 +694,6 @@ func (aggregator *Aggregator) PushReport(sessRpt report.SessReport) {
 		// DEBUG: Log Phase 2 alignment state and rewrite timestamps BEFORE buffering
 		if aggregator.pseudoDriver != nil {
 			p2Start, p2End, simActive := aggregator.pseudoDriver.GetPhase2Window()
-			
-			if simActive {
-				m.StartTime = p2Start
-				m.EndTime = p2End
-			}
 			
 			aggregator.logger.Info("ees PushReport: Kernel report buffered during pseudo mode",
 				zap.String("subscriptionId", sub.ID),
