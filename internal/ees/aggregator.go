@@ -54,7 +54,9 @@ type Aggregator struct {
 	periodAdjusted bool          // Marks if period has been adjusted once
 
 	// Shared ticker synchronization: Phase 2 waits on tickDone after each TickOnce
-	tickDone     chan struct{} // Signal Phase 2 after TickOnce completes
+	// Uses close-broadcast pattern to wake up ALL waiting PseudoDriver subscriptions
+	tickDone     chan struct{} 
+	tickDoneMu   sync.Mutex
 	lastTickTime time.Time     // Wall-clock time of most recent TickOnce
 	lastTickMu   sync.RWMutex
 
@@ -104,8 +106,8 @@ func NewAggregator(
 		// Initialize kernel-ready signal channel (buffered=1 to avoid blocking PushReport)
 		kernelReady: make(chan struct{}, 1),
 
-		// Initialize shared ticker synchronization channel
-		tickDone: make(chan struct{}, 1),
+		// Initialize shared ticker synchronization channel for broadcast
+		tickDone: make(chan struct{}),
 
 		// Initialize legacy snapshot maps (kept for potential future use)
 		lastSnapshot:     make(map[SessionKey]Counters),
@@ -195,10 +197,12 @@ func (aggregator *Aggregator) Run(parentContext context.Context) {
 				}
 
 				// Signal Phase 2 that this tick cycle is done
-				select {
-				case aggregator.tickDone <- struct{}{}:
-				default:
-				}
+				// Broadcast to ALL waiting Phase 2 subscriptions by closing the channel
+				// and creating a fresh one for the next tick cycle.
+				aggregator.tickDoneMu.Lock()
+				close(aggregator.tickDone)
+				aggregator.tickDone = make(chan struct{})
+				aggregator.tickDoneMu.Unlock()
 			}
 		}
 	}
@@ -214,18 +218,16 @@ func (aggregator *Aggregator) getTicker() *time.Ticker {
 // WaitForTick blocks until the next TickOnce completes.
 // Used by Phase 2 to synchronize with Aggregator's heartbeat.
 func (aggregator *Aggregator) WaitForTick() {
-	<-aggregator.tickDone
+	aggregator.tickDoneMu.Lock()
+	ch := aggregator.tickDone
+	aggregator.tickDoneMu.Unlock()
+	<-ch
 }
 
-// DrainTickDone removes any stale tickDone signal from the channel.
-// Must be called before Phase 2's pacing loop to prevent the first
-// WaitForTick() from returning immediately due to a signal that was
-// sent during Phase 1 historical replay.
+// DrainTickDone is no longer needed because tickDone uses a close-broadcast model
+// where the channel is always fresh and empty until fully resolved.
 func (aggregator *Aggregator) DrainTickDone() {
-	select {
-	case <-aggregator.tickDone:
-	default:
-	}
+	// No-op
 }
 
 // GetLastTickTime returns the wall-clock time of the most recent TickOnce trigger.
