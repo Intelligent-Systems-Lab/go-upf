@@ -656,7 +656,7 @@ func (n *LocalNode) Sess(lSeid uint64) (*Sess, error) {
 
 func (n *LocalNode) RemoteSess(rSeid uint64, addr net.Addr) (*Sess, error) {
 	for _, s := range n.sess {
-		if s.RemoteID == rSeid && s.rnode.addr.String() == addr.String() {
+		if s != nil && s.RemoteID == rSeid && s.rnode.addr.String() == addr.String() {
 			return s, nil
 		}
 	}
