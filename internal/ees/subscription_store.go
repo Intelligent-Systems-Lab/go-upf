@@ -79,6 +79,9 @@ func (store *SubscriptionStore) CreateSubscription(newSubscription *Subscription
 	if newSubscription.Snapshots == nil {
 		newSubscription.Snapshots = make(map[SessionKey]Counters)
 	}
+	if newSubscription.LastSentStartTime == nil {
+		newSubscription.LastSentStartTime = make(map[string]time.Time)
+	}
 
 	store.mutexForSubscriptions.Lock()
 	store.subscriptionsByID[subscriptionID] = newSubscription

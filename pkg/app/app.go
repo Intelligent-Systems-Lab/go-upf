@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/sirupsen/logrus"
-	"go.uber.org/zap"
 
 	"github.com/free5gc/go-upf/internal/ees"
 	"github.com/free5gc/go-upf/internal/forwarder"
@@ -169,12 +168,8 @@ func (u *UpfApp) Run() error {
 	if u.cfg.EES != nil && u.cfg.EES.Enabled {
 		logger.MainLog.Infof("Starting EES Module (Hybrid Mode)...")
 
-		// 1. Create Logger
-		eesLogger, err := zap.NewDevelopment()
-		if err != nil {
-			logger.MainLog.Warnf("Failed to create EES logger: %v", err)
-			eesLogger = zap.NewNop() // Fallback to no-op logger
-		}
+		// 1. Use existing EesLog
+		eesLogger := logger.EesLog
 
 		// 2. Create Store / Notifier (shared by both modes)
 		subscriptionStore := ees.NewSubscriptionStore("")

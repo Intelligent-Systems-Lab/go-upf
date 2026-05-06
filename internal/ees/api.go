@@ -21,14 +21,14 @@ import (
 	"strings"
 	"time"
 
-	"go.uber.org/zap"
+	"github.com/sirupsen/logrus"
 )
 
 // Server provides the minimal REST API for EES.
 type Server struct {
 	subscriptionStore *SubscriptionStore
 	aggregator        *Aggregator
-	logger            *zap.Logger
+	logger            *logrus.Entry
 	pseudoDriver      *PseudoDriver // optional: for warm-start historical data replay
 }
 
@@ -36,7 +36,7 @@ type Server struct {
 func NewServer(
 	store *SubscriptionStore,
 	aggregator *Aggregator,
-	logger *zap.Logger,
+	logger *logrus.Entry,
 	pseudoDriver *PseudoDriver,
 ) *Server {
 	return &Server{
@@ -58,7 +58,7 @@ func (server *Server) Serve(listenAddress string) error {
 	mux := http.NewServeMux()
 	server.Routes(mux)
 
-	server.logger.Info("ees api server listening", zap.String("listenAddr", listenAddress))
+	server.logger.WithField("listenAddr", listenAddress).Info("ees api server listening")
 	httpServer := &http.Server{
 		Addr:              listenAddress,
 		Handler:           mux,
@@ -153,10 +153,10 @@ func (server *Server) handleCreateSubscription(w http.ResponseWriter, r *http.Re
 		go func() {
 			if server.pseudoDriver == nil {
 				if _, tickErr := server.aggregator.TickOnce(context.Background()); tickErr != nil {
-					server.logger.Warn("ees on-demand immediate tick failed",
-						zap.String("subscriptionId", subscriptionID),
-						zap.Error(tickErr),
-					)
+					server.logger.WithFields(logrus.Fields{
+						"subscriptionId": subscriptionID,
+						"error":          tickErr,
+					}).Warn("ees on-demand immediate tick failed")
 				}
 			} else {
 				server.logger.Debug("ees on-demand mode: skipping aggregator tick in pseudo mode")
@@ -164,17 +164,17 @@ func (server *Server) handleCreateSubscription(w http.ResponseWriter, r *http.Re
 		}()
 	}
 
-	server.logger.Info("ees subscription created",
-		zap.String("subscriptionId", subscriptionID),
-		zap.String("nfId", subscriptionCandidate.NfID),
-		zap.String("notifUri", subscriptionCandidate.NotifURI),
-		zap.String("event", string(subscriptionCandidate.Event)),
-		zap.String("mode", string(subscriptionCandidate.Mode)),
-		zap.String("trigger", inboundRequest.Subscription.EventReportingMode.Trigger),
-		zap.Int("periodSec", subscriptionCandidate.PeriodSec),
-		zap.Bool("targetAnyUE", subscriptionCandidate.Target.AnyUE),
-		zap.String("targetUeIP", subscriptionCandidate.Target.UeIPAddress),
-	)
+	server.logger.WithFields(logrus.Fields{
+		"subscriptionId": subscriptionID,
+		"nfId":           subscriptionCandidate.NfID,
+		"notifUri":       subscriptionCandidate.NotifURI,
+		"event":          string(subscriptionCandidate.Event),
+		"mode":           string(subscriptionCandidate.Mode),
+		"trigger":        inboundRequest.Subscription.EventReportingMode.Trigger,
+		"periodSec":      subscriptionCandidate.PeriodSec,
+		"targetAnyUE":    subscriptionCandidate.Target.AnyUE,
+		"targetUeIP":     subscriptionCandidate.Target.UeIPAddress,
+	}).Info("ees subscription created")
 
 	locationURI := fmt.Sprintf("%s/nupf-ee/v1/ee-subscriptions/%s", getAPIRoot(r), subscriptionID)
 	w.Header().Set("Location", locationURI)
@@ -199,10 +199,10 @@ func (server *Server) handleCreateSubscription(w http.ResponseWriter, r *http.Re
 	}
 
 	if err := json.NewEncoder(w).Encode(response); err != nil {
-		server.logger.Warn("write create-subscription response failed",
-			zap.String("subscriptionId", subscriptionID),
-			zap.Error(err),
-		)
+		server.logger.WithFields(logrus.Fields{
+			"subscriptionId": subscriptionID,
+			"error":          err,
+		}).Warn("write create-subscription response failed")
 	}
 }
 
@@ -228,10 +228,10 @@ func (server *Server) handleDeleteSubscriptionByID(w http.ResponseWriter, r *htt
 	}
 
 	if err := server.subscriptionStore.DeleteSubscription(subscriptionID); err != nil {
-		server.logger.Error("delete subscription store failed", zap.Error(err))
+		server.logger.WithError(err).Error("delete subscription store failed")
 	}
 
-	server.logger.Info("ees subscription deleted", zap.String("subscriptionId", subscriptionID))
+	server.logger.WithField("subscriptionId", subscriptionID).Info("ees subscription deleted")
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -373,15 +373,13 @@ func (server *Server) validateAndBuildSubscription(req createSubscriptionRequest
 				)
 			}
 
-			server.logger.Debug("ees subscription period validated",
-				zap.Int("requestedPeriod", periodSec),
-				zap.Int("urrPeriod", urrPeriodSec),
-			)
+			server.logger.WithFields(logrus.Fields{
+				"requestedPeriod": periodSec,
+				"urrPeriod":       urrPeriodSec,
+			}).Debug("ees subscription period validated")
 		} else {
 			// URR 2 not yet established, log warning but allow subscription
-			server.logger.Warn("ees cannot validate period: URR 2 not found in perio server",
-				zap.Int("requestedPeriod", periodSec),
-			)
+			server.logger.WithField("requestedPeriod", periodSec).Warn("ees cannot validate period: URR 2 not found in perio server")
 		}
 	}
 
@@ -413,6 +411,7 @@ func (server *Server) validateAndBuildSubscription(req createSubscriptionRequest
 		AppIds:              appIds,
 		TrafficFilters:      trafficFilters,
 		Snapshots:           make(map[SessionKey]Counters),
+		LastSentStartTime:   make(map[string]time.Time),
 	}
 
 	return newSubscription, nil

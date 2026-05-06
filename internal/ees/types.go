@@ -3,7 +3,10 @@
 
 package ees
 
-import "time"
+import (
+	"sync"
+	"time"
+)
 
 // EventType enumerates EES event IDs supported by the UPF.
 // MVP only: USER_DATA_USAGE_MEASURES.
@@ -127,10 +130,19 @@ type Counters struct {
 	EndTime   time.Time // measurement interval end time
 }
 
+// SourceType identifies the origin of a measurement report.
+type SourceType string
+
+const (
+	SourceKernel SourceType = "KERNEL" // Real network truth
+	SourcePseudo SourceType = "PSEUDO" // Simulated historical data
+)
+
 // UsageMeasures represents a delta (relative to last snapshot) plus derived metrics
 // that are ready to be sent in a Notify payload.
 type UsageMeasures struct {
-	Key SessionKey
+	Key    SessionKey
+	Source SourceType // Origin: Kernel or Pseudo
 
 	ULBytesDelta   uint64
 	DLBytesDelta   uint64
@@ -182,6 +194,17 @@ type Subscription struct {
 	// Key: SessionKey (LocalSEID, RemoteSEID)
 	// Val: last counters over [StartTime, EndTime]
 	Snapshots map[SessionKey]Counters
+
+	// LastSentStartTime tracks the latest StartTime sent for each UE IP.
+	// This is used to filter out duplicate reports (e.g. from Pseudo and Kernel overlap).
+	LastSentStartTime map[string]time.Time
+
+	// Mu protects subscription state mutations (LastNotify, LastSentStartTime, etc.)
+	Mu sync.Mutex
+
+	// Simulation state (Internal)
+	IsSimulating bool
+	SimMu        sync.RWMutex
 }
 
 // HasMeasurementType checks if the subscription requests the given measurement type.

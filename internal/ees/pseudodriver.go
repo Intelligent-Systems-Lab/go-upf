@@ -21,7 +21,7 @@ import (
 	"time"
 
 	"github.com/parquet-go/parquet-go"
-	"go.uber.org/zap"
+	"github.com/sirupsen/logrus"
 )
 
 // PseudoDriver reads Parquet files of historical per-packet traffic data
@@ -29,7 +29,7 @@ import (
 type PseudoDriver struct {
 	parquetDir string
 	notifier   *Notifier
-	logger     *zap.Logger
+	logger     *logrus.Entry
 
 	aggregator *Aggregator
 
@@ -37,17 +37,10 @@ type PseudoDriver struct {
 	firstURRReady chan struct{}
 	firstURRTime  time.Time
 	firstURROnce  sync.Once
-
-	// Phase 2 state: tracks the current simulation window so that
-	// Kernel reports can be aligned to the same time grid.
-	isSimulating    bool
-	phase2StartTime time.Time
-	phase2EndTime   time.Time
-	simMu           sync.RWMutex
 }
 
 // NewPseudoDriver constructs a PseudoDriver.
-func NewPseudoDriver(parquetDir string, notifier *Notifier, logger *zap.Logger) *PseudoDriver {
+func NewPseudoDriver(parquetDir string, notifier *Notifier, logger *logrus.Entry) *PseudoDriver {
 	return &PseudoDriver{
 		parquetDir:    parquetDir,
 		notifier:      notifier,
@@ -73,33 +66,11 @@ func (pd *PseudoDriver) SignalFirstURR(urrStartTime time.Time) {
 	pd.firstURROnce.Do(func() {
 		pd.firstURRTime = urrStartTime
 		close(pd.firstURRReady)
-		pd.logger.Info("pseudo driver: first URR signal broadcasted",
-			zap.Time("urrStartTime", urrStartTime),
-		)
+		pd.logger.WithField("urrStartTime", urrStartTime).Info("pseudo driver: first URR signal broadcasted")
 	})
 }
 
-// GetPhase2Window returns the current Phase 2 window's start/end times.
-// If Phase 2 is not active, the bool return is false.
-// Used by PushReport to align Kernel reports to Phase 2's logical timeline.
-func (pd *PseudoDriver) GetPhase2Window() (startTime, endTime time.Time, active bool) {
-	if pd == nil {
-		return time.Time{}, time.Time{}, false
-	}
-	pd.simMu.RLock()
-	defer pd.simMu.RUnlock()
-	return pd.phase2StartTime, pd.phase2EndTime, pd.isSimulating
-}
-
 // ParquetRow represents a single row from the historical traffic Parquet file.
-// The raw Parquet file contains 24 columns, including many string flags and IPs with null values:
-// ts, direction, len, action, ue_ip, session_file, ue_id, flow_id, adjusted_timestamp,
-// source_dataset, app_name, category, activity, session_id, session_duration,
-// relative_time, pkt_len, l4_proto, src_ip, dst_ip, src_port, dst_port, tcp_flags, iat.
-//
-// We intentionally map only the 5 critical fields (ts, direction, len, action, ue_ip)
-// to drastically reduce memory usage, improve garbage collection during streaming,
-// and natively bypass Parquet-Go parsing warnings triggered by Null strings in unused columns.
 type ParquetRow struct {
 	Timestamp float64 `parquet:"ts"`
 	Direction string  `parquet:"direction"`
@@ -168,11 +139,11 @@ func (pd *PseudoDriver) LoadAndReplay(sub *Subscription) {
 		return
 	}
 
-	pd.logger.Info("pseudo driver starting warm-start replay stream",
-		zap.String("subscriptionId", sub.ID),
-		zap.String("parquetDir", pd.parquetDir),
-		zap.Int("periodSec", sub.PeriodSec),
-	)
+	pd.logger.WithFields(logrus.Fields{
+		"subscriptionId": sub.ID,
+		"parquetDir":     pd.parquetDir,
+		"periodSec":      sub.PeriodSec,
+	}).Info("pseudo driver starting warm-start replay stream")
 
 	// Read file.json for breaking time
 	metaPath := pd.parquetDir + "/file.json"
@@ -190,15 +161,15 @@ func (pd *PseudoDriver) LoadAndReplay(sub *Subscription) {
 		breakingTimeSec = 300 // default
 	}
 
-	pd.logger.Info("pseudo driver: using breaking time", zap.Float64("breakingTimeSec", breakingTimeSec))
+	pd.logger.WithField("breakingTimeSec", breakingTimeSec).Info("pseudo driver: using breaking time")
 
 	// 1. Scan directory for Parquet files
 	entries, err := os.ReadDir(pd.parquetDir)
 	if err != nil {
-		pd.logger.Error("pseudo driver failed to read parquet directory",
-			zap.String("subscriptionId", sub.ID),
-			zap.Error(err),
-		)
+		pd.logger.WithFields(logrus.Fields{
+			"subscriptionId": sub.ID,
+			"error":          err,
+		}).Error("pseudo driver failed to read parquet directory")
 		return
 	}
 
@@ -210,10 +181,10 @@ func (pd *PseudoDriver) LoadAndReplay(sub *Subscription) {
 	}
 
 	if len(files) == 0 {
-		pd.logger.Warn("pseudo driver: no parquet files found in directory",
-			zap.String("subscriptionId", sub.ID),
-			zap.String("directory", pd.parquetDir),
-		)
+		pd.logger.WithFields(logrus.Fields{
+			"subscriptionId": sub.ID,
+			"directory":      pd.parquetDir,
+		}).Warn("pseudo driver: no parquet files found in directory")
 		return
 	}
 
@@ -231,9 +202,6 @@ func (pd *PseudoDriver) LoadAndReplay(sub *Subscription) {
 
 	// =====================================================================
 	// STREAMING AGGREGATION (Memory-efficient)
-	// Instead of storing all parsed packets in memory, we read each file
-	// and directly accumulate into counterAccum maps. This reduces peak
-	// memory from O(total_packets) to O(unique_UEs × unique_windows).
 	// =====================================================================
 	pd.logger.Info("pseudo driver: streaming parquet files into aggregation maps")
 	phase1Accum := make(map[windowKey]*counterAccum)
@@ -243,13 +211,11 @@ func (pd *PseudoDriver) LoadAndReplay(sub *Subscription) {
 	var phase1PktCount, phase2PktCount int
 
 	for _, fileObj := range files {
-		// Pass 1: Scan for min/max timestamps without storing any rows
 		minTS, maxTS, rowCount, scanErr := pd.scanTimestampRange(fileObj, sub)
 		if scanErr != nil || rowCount == 0 {
 			continue
 		}
 
-		// Pass 2: Re-read file, process each row directly into accum maps
 		p1, p2 := pd.streamAndAccumulate(
 			fileObj, sub, minTS, globalTimeOffset,
 			alignedBreakingTime, period,
@@ -260,59 +226,42 @@ func (pd *PseudoDriver) LoadAndReplay(sub *Subscription) {
 		globalTimeOffset += (maxTS - minTS) + 0.001
 	}
 
-	pd.logger.Info("pseudo driver: streaming aggregation complete",
-		zap.Int("phase1Entries", len(phase1Accum)),
-		zap.Int("phase2Entries", len(phase2Accum)),
-		zap.Int("phase1Packets", phase1PktCount),
-		zap.Int("phase2Packets", phase2PktCount),
-		zap.Int("uniqueUEs", len(uniqueUEs)),
-	)
+	pd.logger.WithFields(logrus.Fields{
+		"phase1Entries": len(phase1Accum),
+		"phase2Entries": len(phase2Accum),
+		"phase1Packets": phase1PktCount,
+		"phase2Packets": phase2PktCount,
+		"uniqueUEs":     len(uniqueUEs),
+	}).Info("pseudo driver: streaming aggregation complete")
 
-	// Wait for the first URR report from the kernel, then anchor to the
-	// NEXT TickOnce trigger time. This aligns the entire time grid to the
-	// Aggregator's heartbeat, eliminating sub-second drift.
+	// Wait for the first URR report from the kernel to anchor the timeline.
 	var anchorTime time.Time
 	const urrWaitTimeout = 60 * time.Second
-	pd.logger.Info("pseudo driver: waiting for first URR signal to anchor timeline",
-		zap.Duration("timeout", urrWaitTimeout),
-	)
+	pd.logger.WithField("timeout", urrWaitTimeout).Info("pseudo driver: waiting for first URR signal to anchor timeline")
 
 	select {
 	case <-pd.firstURRReady:
 		urrTime := pd.firstURRTime
 		pd.logger.Info("pseudo driver: first URR received, anchoring timeline instantly")
-		// FIX: Do NOT wait for TickOnce to complete. If we wait, we miss the current tick
-		// and fall 5 seconds (one period) behind the Kernel's real-time reporting.
-		// By anchoring immediately using the exact time Kernel pushed its first report,
-		// we guarantee Phase 1 and Phase 2's first window enter the buffer BEFORE the
-		// Aggregator's TickOnce fires.
 		anchorTime = urrTime.Round(time.Second) // Align to clean second boundary
-		pd.logger.Info("pseudo driver: anchored to Kernel URR time",
-			zap.Time("anchorTime", anchorTime),
-		)
 	case <-time.After(urrWaitTimeout):
 		anchorTime = time.Now()
-		pd.logger.Warn("pseudo driver: URR wait timed out, falling back to time.Now()",
-			zap.Duration("timeout", urrWaitTimeout),
-		)
+		pd.logger.WithField("timeout", urrWaitTimeout).Warn("pseudo driver: URR wait timed out, falling back to time.Now()")
 	}
 
 	// Absolute reference time for Parquet offset 0
-	// alignedBreakingTime corresponds to the Anchor.
-	// So offset 0 corresponds to Anchor - alignedBreakingTime
 	referenceTime := anchorTime.Add(-time.Duration(alignedBreakingTime * float64(time.Second)))
 
 	// CRITICAL: Set the subscription's GridAnchor to our referenceTime.
-	// This is the SINGLE SOURCE OF TRUTH for the entire time grid.
 	sub.GridAnchor = referenceTime
-	pd.logger.Info("pseudo driver: grid alignment established",
-		zap.Time("gridAnchor", referenceTime),
-		zap.Time("anchorTime", anchorTime),
-		zap.Float64("alignedBreakingTime", alignedBreakingTime),
-	)
+	pd.logger.WithFields(logrus.Fields{
+		"gridAnchor":           referenceTime,
+		"anchorTime":           anchorTime,
+		"alignedBreakingTime": alignedBreakingTime,
+	}).Info("pseudo driver: grid alignment established")
 
 	// =====================================================================
-	// 5. Build Phase 2 windows from pre-aggregated accum map.
+	// Build Phase 2 windows from pre-aggregated accum map.
 	// =====================================================================
 	var phase2Windows [][]UsageMeasures
 	if len(phase2Accum) > 0 {
@@ -329,58 +278,27 @@ func (pd *PseudoDriver) LoadAndReplay(sub *Subscription) {
 	// =====================================================================
 	// PHASE 1: Warmstart (Historical Burst - Near Instant)
 	// =====================================================================
-	pd.logger.Info("pseudo driver: executing Phase 1 (Warmstart)",
-		zap.Int("packets", phase1PktCount),
-	)
-
-	// Pre-activate simulation state so Kernel reports align to GridAnchor immediately.
-	pd.simMu.Lock()
-	pd.isSimulating = true
-	// Establish the first window of Phase 2 for Kernel snapping
-	startWIdx := int(alignedBreakingTime / period)
-	firstP2Start := referenceTime.Add(time.Duration(float64(startWIdx)*period) * time.Second)
-	pd.phase2StartTime = firstP2Start
-	pd.phase2EndTime = firstP2Start.Add(time.Duration(periodSec) * time.Second)
-	pd.simMu.Unlock()
+	pd.logger.WithField("packets", phase1PktCount).Info("pseudo driver: executing Phase 1 (Warmstart)")
 
 	if len(phase1Accum) > 0 {
 		endWIdx := int(alignedBreakingTime/period) - 1
 		windows := pd.buildWindowsFromAccum(sub, phase1Accum, uniqueUEs, periodSec, referenceTime, endWIdx)
 		phase1Accum = nil // Allow GC to reclaim
-		for wIdx, measures := range windows {
-			logicalTime := referenceTime.Add(time.Duration((wIdx+1)*periodSec) * time.Second)
+		for _, measures := range windows {
+			logicalTime := referenceTime.Add(time.Duration(len(windows)*periodSec) * time.Second)
 			if pd.aggregator != nil {
 				pd.aggregator.PushHistoricalMeasures(sub, measures, logicalTime)
 			}
-			// Instant burst - No sleep.
 		}
 	} else {
-		// Fast-forward LastNotify
 		sub.LastNotify = anchorTime
 	}
-
-	// =====================================================================
-	// DEBUG: Phase 1 → Phase 2 transition state dump
-	// =====================================================================
-	pd.logger.Info("pseudo driver: === PHASE TRANSITION 1→2 STATE DUMP ===",
-		zap.Time("anchorTime", anchorTime),
-		zap.Time("gridAnchor", sub.GridAnchor),
-		zap.Time("lastNotify", sub.LastNotify),
-		zap.Float64("alignedBreakingTimeSec", alignedBreakingTime),
-		zap.Int("phase1PacketCount", phase1PktCount),
-		zap.Int("phase2PacketCount", phase2PktCount),
-		zap.Int("phase2WindowCount", len(phase2Windows)),
-		zap.Int("startWIdx", startWIdx),
-		zap.Bool("isSimulating", pd.isSimulating),
-		zap.Time("phase2StartTime", pd.phase2StartTime),
-		zap.Time("phase2EndTime", pd.phase2EndTime),
-		zap.Time("wallClockNow", time.Now()),
-	)
 
 	// =====================================================================
 	// PHASE 2: Parallel Future Simulation (Synchronized pacing)
 	// =====================================================================
 	if len(phase2Windows) > 0 && pd.aggregator != nil {
+		startWIdx := int(alignedBreakingTime / period)
 		pd.simulateFutureRealTime(sub, phase2Windows, startWIdx)
 	}
 }
@@ -393,8 +311,7 @@ func matchesSubscriptionFilter(sub *Subscription, ueIP string) bool {
 	return sub.Target.UeIPAddress != "" && sub.Target.UeIPAddress == ueIP
 }
 
-// scanTimestampRange reads through a Parquet file to find the min/max timestamps
-// of rows matching the subscription filter. No row data is stored in memory.
+// scanTimestampRange reads through a Parquet file to find the min/max timestamps.
 func (pd *PseudoDriver) scanTimestampRange(filePath string, sub *Subscription) (minTS, maxTS float64, rowCount int, err error) {
 	f, err := os.Open(filePath)
 	if err != nil {
@@ -435,8 +352,7 @@ func (pd *PseudoDriver) scanTimestampRange(filePath string, sub *Subscription) (
 	return
 }
 
-// streamAndAccumulate re-reads a Parquet file and accumulates each matching row
-// directly into the phase1/phase2 accum maps. No intermediate slice is created.
+// streamAndAccumulate re-reads a Parquet file and accumulates each matching row.
 func (pd *PseudoDriver) streamAndAccumulate(
 	filePath string, sub *Subscription,
 	minTS, globalTimeOffset, alignedBreakingTime, period float64,
@@ -445,8 +361,10 @@ func (pd *PseudoDriver) streamAndAccumulate(
 ) (phase1Count, phase2Count int) {
 	f, err := os.Open(filePath)
 	if err != nil {
-		pd.logger.Error("pseudo driver: failed to re-open parquet file",
-			zap.String("file", filePath), zap.Error(err))
+		pd.logger.WithFields(logrus.Fields{
+			"file":  filePath,
+			"error": err,
+		}).Error("pseudo driver: failed to re-open parquet file")
 		return
 	}
 	defer f.Close()
@@ -490,8 +408,6 @@ func (pd *PseudoDriver) streamAndAccumulate(
 }
 
 // buildWindowsFromAccum converts a pre-built counterAccum map into ordered [][]UsageMeasures.
-// This replaces aggregateIntoWindows: instead of iterating over raw packets to build
-// the accum map internally, it accepts an already-built map from streaming aggregation.
 func (pd *PseudoDriver) buildWindowsFromAccum(
 	sub *Subscription,
 	accum map[windowKey]*counterAccum,
@@ -514,7 +430,7 @@ func (pd *PseudoDriver) buildWindowsFromAccum(
 		}
 	}
 
-	// Build output: one []UsageMeasures per window (may contain multiple UEs)
+	// Build output: one []UsageMeasures per window
 	windowResults := make(map[int][]UsageMeasures)
 
 	for wIdx := 0; wIdx <= maxWindowIndex; wIdx++ {
@@ -573,86 +489,49 @@ func (pd *PseudoDriver) buildWindowsFromAccum(
 
 func (pd *PseudoDriver) simulateFutureRealTime(sub *Subscription, windows [][]UsageMeasures, startWIdx int) {
 	defer func() {
-		pd.simMu.Lock()
-		pd.isSimulating = false
-		pd.simMu.Unlock()
-		pd.logger.Info("pseudo driver: Phase 2 simulation ended, Kernel reports back to normal")
+		sub.SimMu.Lock()
+		sub.IsSimulating = false
+		sub.SimMu.Unlock()
+		pd.logger.WithField("subId", sub.ID).Info("pseudo driver: Phase 2 simulation ended for subscription")
 	}()
 
-	pd.logger.Info("pseudo driver: Phase 2 future simulation pacing loop started",
-		zap.Int("windowsToPace", len(windows)-startWIdx),
-	)
+	sub.SimMu.Lock()
+	sub.IsSimulating = true
+	sub.SimMu.Unlock()
 
-	// Clean up any stale signals accumulated during history replay.
-	pd.aggregator.DrainTickDone()
+	pd.logger.WithFields(logrus.Fields{
+		"subId":         sub.ID,
+		"windowsToPace": len(windows) - startWIdx,
+	}).Info("pseudo driver: Phase 2 future simulation pacing loop started")
 
-	// DEBUG: Dump Aggregator buffer state at Phase 2 entry
-	pd.aggregator.DebugDumpBufferState("Phase2-Entry")
+	aggPeriodSec := int(pd.aggregator.reportPeriod.Seconds())
+	if aggPeriodSec <= 0 {
+		aggPeriodSec = 5
+	}
+	ticksPerWindow := sub.PeriodSec / aggPeriodSec
+	if ticksPerWindow < 1 {
+		ticksPerWindow = 1
+	}
 
-	// STAGE 2: AGGREGATOR-SYNCHRONIZED PACING.
-	// We iterate through pre-computed windows starting from the first live index.
-	//
-	// CRITICAL FIX: The loop order is "Wait → Push" (not "Push → Wait").
-	// Rationale:
-	//   After TickOnce[N-1] fires, BOTH Phase 2 and Kernel push data for window N
-	//   into the buffer over the next ~5 seconds. Then TickOnce[N] fires and
-	//   collects them together in one consolidated notification.
-	//
-	//   If we used "Push → Wait", Phase 2 would push window N+1's empty padding
-	//   immediately after TickOnce[N], but Kernel's real data for N+1 wouldn't
-	//   arrive until the NEXT Kernel timer fires (~5s later). So Phase 2's empty
-	//   padding would go out in TickOnce[N+1] while Kernel's real data would only
-	//   appear in TickOnce[N+2] — permanently out of sync by one period.
 	for i := startWIdx; i < len(windows); i++ {
 		winMeasures := windows[i]
 
-		// 1. Wait for TickOnce[N-1] to finish first.
-		//    This marks the beginning of the ~5s interval leading up to TickOnce[N].
-		waitStart := time.Now()
-		pd.aggregator.WaitForTick()
-		waitDuration := time.Since(waitStart)
-
-		// 2. Publish current Phase 2 window time for Kernel report alignment.
-		//    Kernel reports arriving during the next ~5s wait will use THIS window.
-		if len(winMeasures) > 0 {
-			pd.simMu.Lock()
-			oldP2Start := pd.phase2StartTime
-			oldP2End := pd.phase2EndTime
-			pd.phase2StartTime = winMeasures[0].StartTime
-			pd.phase2EndTime = winMeasures[0].EndTime
-			pd.simMu.Unlock()
-
-			pd.logger.Info("pseudo driver: Phase 2 window published",
-				zap.Int("windowIndex", i),
-				zap.Time("newP2Start", winMeasures[0].StartTime),
-				zap.Time("newP2End", winMeasures[0].EndTime),
-				zap.Time("prevP2Start", oldP2Start),
-				zap.Time("prevP2End", oldP2End),
-				zap.Time("wallClockNow", time.Now()),
-			)
+		// Wait for the correct number of Aggregator heartbeats
+		for t := 0; t < ticksPerWindow; t++ {
+			pd.aggregator.WaitForTick()
 		}
 
-		pd.logger.Info("pseudo driver: Phase 2 WaitForTick returned",
-			zap.Int("windowIndex", i),
-			zap.Duration("waitDuration", waitDuration),
-			zap.Time("wallClockNow", time.Now()),
-			zap.Time("aggLastTickTime", pd.aggregator.GetLastTickTime()),
-		)
-
-		// 3. NOW push this window's data into Buffer.
-		//    Kernel's data for this same window will arrive over the next ~5s.
-		//    Both will be collected together by TickOnce[N].
 		if len(winMeasures) > 0 && pd.aggregator != nil {
-			pd.logger.Info("pseudo driver: pushing Phase 2 data",
-				zap.Int("windowIndex", i),
-				zap.Int("measures", len(winMeasures)),
-				zap.Time("dataStartTime", winMeasures[0].StartTime),
-				zap.Time("dataEndTime", winMeasures[0].EndTime),
-				zap.Time("wallClockNow", time.Now()),
-			)
+			pd.logger.WithFields(logrus.Fields{
+				"subId":         sub.ID,
+				"windowIndex":   i,
+				"measures":      len(winMeasures),
+				"dataStartTime": winMeasures[0].StartTime,
+				"dataEndTime":   winMeasures[0].EndTime,
+			}).Info("pseudo driver: pushing Phase 2 data")
 			pd.aggregator.PushLiveMeasures(sub, winMeasures)
 		}
 	}
 
-	pd.logger.Info("pseudo driver: Phase 2 future simulation completed")
+	pd.logger.WithField("subId", sub.ID).Info("pseudo driver: Phase 2 future simulation completed for subscription")
 }

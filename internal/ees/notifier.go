@@ -21,13 +21,13 @@ import (
 	"net/http"
 	"time"
 
-	"go.uber.org/zap"
+	"github.com/sirupsen/logrus"
 )
 
 // Notifier is responsible for delivering EES notifications to subscribers.
 type Notifier struct {
 	httpClient         *http.Client
-	logger             *zap.Logger
+	logger             *logrus.Entry
 	defaultUserAgent   string
 	requestTimeout     time.Duration
 	maxResponseBodyLen int64
@@ -36,7 +36,7 @@ type Notifier struct {
 // NewNotifier creates a notifier with sane defaults.
 // - request timeout: 5s
 // - connect + TLS handshake timeouts are governed by the http.Transport below.
-func NewNotifier(logger *zap.Logger) *Notifier {
+func NewNotifier(logger *logrus.Entry) *Notifier {
 	transport := &http.Transport{
 		// Reasonable defaults for a control-plane style HTTP call.
 		DialContext: (&net.Dialer{
@@ -169,21 +169,21 @@ func (notifier *Notifier) Notify(subscription *Subscription, measures []UsageMea
 
 	resp, err := notifier.httpClient.Do(req)
 	if err != nil {
-		notifier.logger.Warn("ees notify failed: http request error",
-			zap.String("subscriptionId", subscription.ID),
-			zap.String("notifUri", subscription.NotifURI),
-			zap.Error(err),
-			zap.Int("items", len(payload.NotificationItems)),
-		)
+		notifier.logger.WithFields(logrus.Fields{
+			"subscriptionId": subscription.ID,
+			"notifUri":       subscription.NotifURI,
+			"error":          err,
+			"items":          len(payload.NotificationItems),
+		}).Warn("ees notify failed: http request error")
 		return fmt.Errorf("notify: http request failed: %w", err)
 	}
 
 	defer func() {
 		if closeErr := resp.Body.Close(); closeErr != nil {
-			notifier.logger.Debug("ees notify: close response body failed",
-				zap.String("subscriptionId", subscription.ID),
-				zap.Error(closeErr),
-			)
+			notifier.logger.WithFields(logrus.Fields{
+				"subscriptionId": subscription.ID,
+				"error":          closeErr,
+			}).Debug("ees notify: close response body failed")
 		}
 	}()
 
@@ -205,22 +205,22 @@ func (notifier *Notifier) Notify(subscription *Subscription, measures []UsageMea
 			snippet = fmt.Sprintf("status=%s body=%q", resp.Status, string(bodyBytes))
 		}
 
-		notifier.logger.Warn("ees notify failed: non-2xx response",
-			zap.String("subscriptionId", subscription.ID),
-			zap.String("notifUri", subscription.NotifURI),
-			zap.Int("statusCode", resp.StatusCode),
-			zap.Int("items", len(payload.NotificationItems)),
-			zap.String("response", snippet),
-		)
+		notifier.logger.WithFields(logrus.Fields{
+			"subscriptionId": subscription.ID,
+			"notifUri":       subscription.NotifURI,
+			"statusCode":     resp.StatusCode,
+			"items":          len(payload.NotificationItems),
+			"response":       snippet,
+		}).Warn("ees notify failed: non-2xx response")
 		return fmt.Errorf("notify: non-2xx response: %s", resp.Status)
 	}
 
 	// Success log (compact, with essential identifiers).
-	notifier.logger.Debug("ees notify success",
-		zap.String("subscriptionId", subscription.ID),
-		zap.String("notifUri", subscription.NotifURI),
-		zap.Int("items", len(payload.NotificationItems)),
-	)
+	notifier.logger.WithFields(logrus.Fields{
+		"subscriptionId": subscription.ID,
+		"notifUri":       subscription.NotifURI,
+		"items":          len(payload.NotificationItems),
+	}).Debug("ees notify success")
 
 	return nil
 }
