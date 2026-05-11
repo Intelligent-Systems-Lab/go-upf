@@ -172,6 +172,23 @@ func (aggregator *Aggregator) TickOnce(ctx context.Context) (int, error) {
 			continue
 		}
 
+                // FINAL GATE: If Pseudo-driver is still doing IO (Phase 1), skip this subscription
+                // to prevent Kernel data from "moving the timeline" prematurely.
+                subscription.SimMu.RLock()
+                isWarmingUp := subscription.WarmupPending
+                subscription.SimMu.RUnlock()
+                if isWarmingUp {
+                        // Re-buffer the data for next tick
+                        aggregator.mu.Lock()
+                        if list, ok := bufferedReports[subscription.ID]; ok {
+                                aggregator.reportBuffer[subscription.ID] = append(aggregator.reportBuffer[subscription.ID], list...)
+                        }
+                        aggregator.mu.Unlock()
+                        
+                        aggregator.logger.WithField("subId", subscription.ID).Info("ees aggregator: waiting for pseudo-driver warm-up, skipping tick")
+                        continue
+                }
+
 		subscription.Mu.Lock()
 		usageMeasuresList, hasReports := bufferedReports[subscription.ID]
 
@@ -302,13 +319,7 @@ func (aggregator *Aggregator) consolidateWithPriority(reports []UsageMeasures) [
 			consolidated[key] = &rCopy
 			continue
 		}
-		if r.Source == SourceKernel && existing.Source == SourcePseudo {
-			rCopy := r
-			consolidated[key] = &rCopy
-			aggregator.logger.WithFields(logrus.Fields{
-				"ueIp": r.UeIpv4Addr, "startTime": r.StartTime,
-			}).Debug("ees priority consolidation: Kernel overwrote Pseudo")
-		} else if r.Source == existing.Source {
+		if true {
 			existing.ULBytesDelta += r.ULBytesDelta
 			existing.DLBytesDelta += r.DLBytesDelta
 			existing.ULPacketsDelta += r.ULPacketsDelta

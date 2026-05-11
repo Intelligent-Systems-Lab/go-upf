@@ -294,7 +294,12 @@ func (pd *PseudoDriver) LoadAndReplay(sub *Subscription) {
 		sub.LastNotify = anchorTime
 	}
 
-	// =====================================================================
+	        sub.SimMu.Lock()
+        sub.WarmupPending = false
+        sub.SimMu.Unlock()
+        pd.logger.WithField("subId", sub.ID).Info("pseudo driver: Phase 1 warmstart completed, clearing WarmupPending flag")
+
+        // =====================================================================
 	// PHASE 2: Parallel Future Simulation (Synchronized pacing)
 	// =====================================================================
 	if len(phase2Windows) > 0 && pd.aggregator != nil {
@@ -516,12 +521,7 @@ func (pd *PseudoDriver) simulateFutureRealTime(sub *Subscription, windows [][]Us
 	for i := startWIdx; i < len(windows); i++ {
 		winMeasures := windows[i]
 
-		// Wait for the correct number of Aggregator heartbeats
-		for t := 0; t < ticksPerWindow; t++ {
-			pd.aggregator.WaitForTick()
-		}
-
-		if len(winMeasures) > 0 && pd.aggregator != nil {
+				if len(winMeasures) > 0 && pd.aggregator != nil {
 			pd.logger.WithFields(logrus.Fields{
 				"subId":         sub.ID,
 				"windowIndex":   i,
@@ -530,6 +530,18 @@ func (pd *PseudoDriver) simulateFutureRealTime(sub *Subscription, windows [][]Us
 				"dataEndTime":   winMeasures[0].EndTime,
 			}).Info("pseudo driver: pushing Phase 2 data")
 			pd.aggregator.PushLiveMeasures(sub, winMeasures)
+		}
+
+                // Catch-up logic: if real time has already passed this window's EndTime, skip waiting
+                windowEnd := sub.GridAnchor.Add(time.Duration((i+1)*sub.PeriodSec) * time.Second)
+		if time.Now().After(windowEnd) {
+                        pd.logger.Debug("pseudo driver: lagging behind real time, skipping tick wait to catch up")
+                        continue
+                }
+
+// Wait for the correct number of Aggregator heartbeats
+		for t := 0; t < ticksPerWindow; t++ {
+			pd.aggregator.WaitForTick()
 		}
 	}
 

@@ -144,6 +144,9 @@ func (server *Server) handleCreateSubscription(w http.ResponseWriter, r *http.Re
 	if server.pseudoDriver != nil {
 		// Retrieve the stored subscription (with ID assigned) for the pseudo driver
 		if storedSub, found := server.subscriptionStore.GetSubscription(subscriptionID); found {
+                        storedSub.SimMu.Lock()
+                        storedSub.WarmupPending = true
+                        storedSub.SimMu.Unlock()
 			go server.pseudoDriver.LoadAndReplay(storedSub)
 		}
 	}

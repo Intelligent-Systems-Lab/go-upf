@@ -204,6 +204,7 @@ type Subscription struct {
 
 	// Simulation state (Internal)
 	IsSimulating bool
+        WarmupPending bool
 	SimMu        sync.RWMutex
 }
 
