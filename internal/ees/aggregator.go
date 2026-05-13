@@ -172,22 +172,22 @@ func (aggregator *Aggregator) TickOnce(ctx context.Context) (int, error) {
 			continue
 		}
 
-                // FINAL GATE: If Pseudo-driver is still doing IO (Phase 1), skip this subscription
-                // to prevent Kernel data from "moving the timeline" prematurely.
-                subscription.SimMu.RLock()
-                isWarmingUp := subscription.WarmupPending
-                subscription.SimMu.RUnlock()
-                if isWarmingUp {
-                        // Re-buffer the data for next tick
-                        aggregator.mu.Lock()
-                        if list, ok := bufferedReports[subscription.ID]; ok {
-                                aggregator.reportBuffer[subscription.ID] = append(aggregator.reportBuffer[subscription.ID], list...)
-                        }
-                        aggregator.mu.Unlock()
-                        
-                        aggregator.logger.WithField("subId", subscription.ID).Info("ees aggregator: waiting for pseudo-driver warm-up, skipping tick")
-                        continue
-                }
+		// FINAL GATE: If Pseudo-driver is still doing IO (Phase 1), skip this subscription
+		// to prevent Kernel data from "moving the timeline" prematurely.
+		subscription.SimMu.RLock()
+		isWarmingUp := subscription.WarmupPending
+		subscription.SimMu.RUnlock()
+		if isWarmingUp {
+			// Re-buffer the data for next tick
+			aggregator.mu.Lock()
+			if list, ok := bufferedReports[subscription.ID]; ok {
+				aggregator.reportBuffer[subscription.ID] = append(aggregator.reportBuffer[subscription.ID], list...)
+			}
+			aggregator.mu.Unlock()
+
+			aggregator.logger.WithField("subId", subscription.ID).Info("ees aggregator: waiting for pseudo-driver warm-up, skipping tick")
+			continue
+		}
 
 		subscription.Mu.Lock()
 		usageMeasuresList, hasReports := bufferedReports[subscription.ID]
@@ -319,12 +319,12 @@ func (aggregator *Aggregator) consolidateWithPriority(reports []UsageMeasures) [
 			consolidated[key] = &rCopy
 			continue
 		}
-		if true {
-			existing.ULBytesDelta += r.ULBytesDelta
-			existing.DLBytesDelta += r.DLBytesDelta
-			existing.ULPacketsDelta += r.ULPacketsDelta
-			existing.DLPacketsDelta += r.DLPacketsDelta
-		}
+
+		// Additive logic: both Pseudo and Kernel sources contribute to the total
+		existing.ULBytesDelta += r.ULBytesDelta
+		existing.DLBytesDelta += r.DLBytesDelta
+		existing.ULPacketsDelta += r.ULPacketsDelta
+		existing.DLPacketsDelta += r.DLPacketsDelta
 	}
 	result := make([]UsageMeasures, 0, len(consolidated))
 	for _, m := range consolidated {
@@ -430,7 +430,8 @@ func (aggregator *Aggregator) PushReport(sessRpt report.SessReport) {
 		}
 		sub.Mu.Lock()
 		if aggregator.pseudoDriver != nil {
-			aggregator.pseudoDriver.SignalFirstURR(time.Now())
+			// ANCHOR FIX: Use actual network timestamp instead of time.Now()
+			aggregator.pseudoDriver.SignalFirstURR(m.EndTime)
 		}
 		if sub.GridAnchor.IsZero() {
 			if aggregator.pseudoDriver == nil {

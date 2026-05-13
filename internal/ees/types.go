@@ -203,9 +203,9 @@ type Subscription struct {
 	Mu sync.Mutex
 
 	// Simulation state (Internal)
-	IsSimulating bool
-        WarmupPending bool
-	SimMu        sync.RWMutex
+	IsSimulating  bool
+	WarmupPending bool
+	SimMu         sync.RWMutex
 }
 
 // HasMeasurementType checks if the subscription requests the given measurement type.

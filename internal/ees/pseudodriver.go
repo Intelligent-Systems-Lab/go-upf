@@ -37,6 +37,11 @@ type PseudoDriver struct {
 	firstURRReady chan struct{}
 	firstURRTime  time.Time
 	firstURROnce  sync.Once
+
+	// Batching mechanism for consecutive subscriptions
+	batchMu      sync.Mutex
+	pendingSubs  []*Subscription
+	batchRunning bool
 }
 
 // NewPseudoDriver constructs a PseudoDriver.
@@ -47,6 +52,47 @@ func NewPseudoDriver(parquetDir string, notifier *Notifier, logger *logrus.Entry
 		logger:        logger,
 		firstURRReady: make(chan struct{}),
 	}
+}
+
+// ScheduleReplay adds a subscription to the next replay batch.
+// If no batch is running, it starts a timer to coalesce consecutive requests.
+func (pd *PseudoDriver) ScheduleReplay(sub *Subscription) {
+	if pd == nil {
+		return
+	}
+	pd.batchMu.Lock()
+	defer pd.batchMu.Unlock()
+
+	pd.pendingSubs = append(pd.pendingSubs, sub)
+	pd.logger.WithField("subId", sub.ID).Info("pseudo driver: subscription scheduled for batch replay")
+
+	if !pd.batchRunning {
+		pd.batchRunning = true
+		go pd.runBatchLoop()
+	}
+}
+
+func (pd *PseudoDriver) runBatchLoop() {
+	// Coalesce window: wait for more consecutive subscriptions
+	time.Sleep(500 * time.Millisecond)
+
+	pd.batchMu.Lock()
+	subs := pd.pendingSubs
+	pd.pendingSubs = nil
+	pd.batchMu.Unlock()
+
+	if len(subs) > 0 {
+		pd.LoadAndReplayBatch(subs)
+	}
+
+	pd.batchMu.Lock()
+	if len(pd.pendingSubs) > 0 {
+		// New subs arrived while we were processing or sleeping
+		go pd.runBatchLoop()
+	} else {
+		pd.batchRunning = false
+	}
+	pd.batchMu.Unlock()
 }
 
 // SetAggregator injects the Aggregator reference.
@@ -103,6 +149,13 @@ type counterAccum struct {
 	endTime   float64
 }
 
+type subContext struct {
+	sub         *Subscription
+	phase1Accum map[windowKey]*counterAccum
+	phase2Accum map[windowKey]*counterAccum
+	uniqueUEs   map[string]bool
+}
+
 // accumulatePacket adds a parsed packet's data to the corresponding counter in the map.
 func accumulatePacket(accum map[windowKey]*counterAccum, key windowKey, pkt parsedPacket) {
 	ca, ok := accum[key]
@@ -130,20 +183,22 @@ func accumulatePacket(accum map[windowKey]*counterAccum, key windowKey, pkt pars
 	}
 }
 
-// LoadAndReplay reads the Parquet files from directory chronologically,
-// aggregates packets into corresponding continuous time windows,
-// and sends them as EES notifications to the given subscription.
-// This method is designed to be called in a goroutine.
-func (pd *PseudoDriver) LoadAndReplay(sub *Subscription) {
-	if pd == nil || pd.parquetDir == "" {
+// LoadAndReplayBatch reads the Parquet files and replays them for multiple subscriptions.
+func (pd *PseudoDriver) LoadAndReplayBatch(subs []*Subscription) {
+	if pd == nil || pd.parquetDir == "" || len(subs) == 0 {
 		return
 	}
 
+	subIDs := make([]string, len(subs))
+	for i, s := range subs {
+		subIDs[i] = s.ID
+	}
+
 	pd.logger.WithFields(logrus.Fields{
-		"subscriptionId": sub.ID,
-		"parquetDir":     pd.parquetDir,
-		"periodSec":      sub.PeriodSec,
-	}).Info("pseudo driver starting warm-start replay stream")
+		"subscriptionCount": len(subs),
+		"subscriptionIds":   subIDs,
+		"parquetDir":        pd.parquetDir,
+	}).Info("pseudo driver starting warm-start batch replay stream")
 
 	// Read file.json for breaking time
 	metaPath := pd.parquetDir + "/file.json"
@@ -167,8 +222,7 @@ func (pd *PseudoDriver) LoadAndReplay(sub *Subscription) {
 	entries, err := os.ReadDir(pd.parquetDir)
 	if err != nil {
 		pd.logger.WithFields(logrus.Fields{
-			"subscriptionId": sub.ID,
-			"error":          err,
+			"error": err,
 		}).Error("pseudo driver failed to read parquet directory")
 		return
 	}
@@ -182,57 +236,59 @@ func (pd *PseudoDriver) LoadAndReplay(sub *Subscription) {
 
 	if len(files) == 0 {
 		pd.logger.WithFields(logrus.Fields{
-			"subscriptionId": sub.ID,
-			"directory":      pd.parquetDir,
+			"directory": pd.parquetDir,
 		}).Warn("pseudo driver: no parquet files found in directory")
 		return
 	}
 
 	sort.Strings(files)
 
-	periodSec := sub.PeriodSec
+	// Determine common alignment (using first sub's period for simplicity,
+	// assuming they are identical in batch)
+	periodSec := subs[0].PeriodSec
 	if periodSec <= 0 {
 		periodSec = 5 // default fallback
 	}
 	period := float64(periodSec)
-
-	// CRITICAL GRID ALIGNMENT:
-	// We align breakingTimeSec to the next multiple of periodSec.
 	alignedBreakingTime := math.Ceil(breakingTimeSec/period) * period
 
 	// =====================================================================
-	// STREAMING AGGREGATION (Memory-efficient)
+	// STREAMING AGGREGATION (Shared pass for all subs in batch)
 	// =====================================================================
 	pd.logger.Info("pseudo driver: streaming parquet files into aggregation maps")
-	phase1Accum := make(map[windowKey]*counterAccum)
-	phase2Accum := make(map[windowKey]*counterAccum)
-	uniqueUEs := make(map[string]bool)
+
+	contexts := make([]*subContext, len(subs))
+	for i, s := range subs {
+		contexts[i] = &subContext{
+			sub:         s,
+			phase1Accum: make(map[windowKey]*counterAccum),
+			phase2Accum: make(map[windowKey]*counterAccum),
+			uniqueUEs:   make(map[string]bool),
+		}
+	}
+
 	globalTimeOffset := 0.0
-	var phase1PktCount, phase2PktCount int
+	var totalP1PktCount, totalP2PktCount int
 
 	for _, fileObj := range files {
-		minTS, maxTS, rowCount, scanErr := pd.scanTimestampRange(fileObj, sub)
+		minTS, maxTS, rowCount, scanErr := pd.scanTimestampRangeBatch(fileObj, subs)
 		if scanErr != nil || rowCount == 0 {
 			continue
 		}
 
-		p1, p2 := pd.streamAndAccumulate(
-			fileObj, sub, minTS, globalTimeOffset,
+		p1, p2 := pd.streamAndAccumulateBatch(
+			fileObj, contexts, minTS, globalTimeOffset,
 			alignedBreakingTime, period,
-			phase1Accum, phase2Accum, uniqueUEs,
 		)
-		phase1PktCount += p1
-		phase2PktCount += p2
+		totalP1PktCount += p1
+		totalP2PktCount += p2
 		globalTimeOffset += (maxTS - minTS) + 0.001
 	}
 
 	pd.logger.WithFields(logrus.Fields{
-		"phase1Entries": len(phase1Accum),
-		"phase2Entries": len(phase2Accum),
-		"phase1Packets": phase1PktCount,
-		"phase2Packets": phase2PktCount,
-		"uniqueUEs":     len(uniqueUEs),
-	}).Info("pseudo driver: streaming aggregation complete")
+		"totalPhase1Packets": totalP1PktCount,
+		"totalPhase2Packets": totalP2PktCount,
+	}).Info("pseudo driver: shared streaming aggregation complete")
 
 	// Wait for the first URR report from the kernel to anchor the timeline.
 	var anchorTime time.Time
@@ -252,72 +308,69 @@ func (pd *PseudoDriver) LoadAndReplay(sub *Subscription) {
 	// Absolute reference time for Parquet offset 0
 	referenceTime := anchorTime.Add(-time.Duration(alignedBreakingTime * float64(time.Second)))
 
-	// CRITICAL: Set the subscription's GridAnchor to our referenceTime.
-	sub.GridAnchor = referenceTime
-	pd.logger.WithFields(logrus.Fields{
-		"gridAnchor":           referenceTime,
-		"anchorTime":           anchorTime,
-		"alignedBreakingTime": alignedBreakingTime,
-	}).Info("pseudo driver: grid alignment established")
+	for _, ctx := range contexts {
+		ctx.sub.GridAnchor = referenceTime
 
-	// =====================================================================
-	// Build Phase 2 windows from pre-aggregated accum map.
-	// =====================================================================
-	var phase2Windows [][]UsageMeasures
-	if len(phase2Accum) > 0 {
-		endP2WIdx := 0
-		for key := range phase2Accum {
-			if key.windowIndex > endP2WIdx {
-				endP2WIdx = key.windowIndex
+		// Phase 1: Warmstart
+		if len(ctx.phase1Accum) > 0 {
+			endWIdx := int(alignedBreakingTime/period) - 1
+			windows := pd.buildWindowsFromAccum(ctx.sub, ctx.phase1Accum, ctx.uniqueUEs, periodSec, referenceTime, endWIdx)
+			ctx.phase1Accum = nil // GC
+			for _, measures := range windows {
+				logicalTime := referenceTime.Add(time.Duration(len(windows)*periodSec) * time.Second)
+				if pd.aggregator != nil {
+					pd.aggregator.PushHistoricalMeasures(ctx.sub, measures, logicalTime)
+				}
 			}
+		} else {
+			ctx.sub.LastNotify = anchorTime
 		}
-		phase2Windows = pd.buildWindowsFromAccum(sub, phase2Accum, uniqueUEs, periodSec, referenceTime, endP2WIdx)
-		phase2Accum = nil // Allow GC to reclaim
+
+		ctx.sub.SimMu.Lock()
+		ctx.sub.WarmupPending = false
+		ctx.sub.SimMu.Unlock()
 	}
 
-	// =====================================================================
-	// PHASE 1: Warmstart (Historical Burst - Near Instant)
-	// =====================================================================
-	pd.logger.WithField("packets", phase1PktCount).Info("pseudo driver: executing Phase 1 (Warmstart)")
+	pd.logger.Info("pseudo driver: batch Phase 1 warmstart completed")
 
-	if len(phase1Accum) > 0 {
-		endWIdx := int(alignedBreakingTime/period) - 1
-		windows := pd.buildWindowsFromAccum(sub, phase1Accum, uniqueUEs, periodSec, referenceTime, endWIdx)
-		phase1Accum = nil // Allow GC to reclaim
-		for _, measures := range windows {
-			logicalTime := referenceTime.Add(time.Duration(len(windows)*periodSec) * time.Second)
-			if pd.aggregator != nil {
-				pd.aggregator.PushHistoricalMeasures(sub, measures, logicalTime)
+	// =====================================================================
+	// PHASE 2: Parallel Future Simulation
+	// =====================================================================
+	var wg sync.WaitGroup
+	for _, ctx := range contexts {
+		if len(ctx.phase2Accum) > 0 && pd.aggregator != nil {
+			startWIdx := int(alignedBreakingTime / period)
+			endP2WIdx := 0
+			for key := range ctx.phase2Accum {
+				if key.windowIndex > endP2WIdx {
+					endP2WIdx = key.windowIndex
+				}
 			}
+			windows := pd.buildWindowsFromAccum(ctx.sub, ctx.phase2Accum, ctx.uniqueUEs, periodSec, referenceTime, endP2WIdx)
+			ctx.phase2Accum = nil // GC
+
+			wg.Add(1)
+			go func(s *Subscription, w [][]UsageMeasures, idx int) {
+				defer wg.Done()
+				pd.simulateFutureRealTime(s, w, idx)
+			}(ctx.sub, windows, startWIdx)
 		}
-	} else {
-		sub.LastNotify = anchorTime
 	}
-
-	        sub.SimMu.Lock()
-        sub.WarmupPending = false
-        sub.SimMu.Unlock()
-        pd.logger.WithField("subId", sub.ID).Info("pseudo driver: Phase 1 warmstart completed, clearing WarmupPending flag")
-
-        // =====================================================================
-	// PHASE 2: Parallel Future Simulation (Synchronized pacing)
-	// =====================================================================
-	if len(phase2Windows) > 0 && pd.aggregator != nil {
-		startWIdx := int(alignedBreakingTime / period)
-		pd.simulateFutureRealTime(sub, phase2Windows, startWIdx)
-	}
+	wg.Wait()
 }
 
-// matchesSubscriptionFilter checks if a UE IP matches the subscription's target scope.
-func matchesSubscriptionFilter(sub *Subscription, ueIP string) bool {
-	if sub.Target.AnyUE {
-		return true
+// matchesAnySubscription checks if a UE IP matches any subscription in the batch.
+func matchesAnySubscription(subs []*Subscription, ueIP string) bool {
+	for _, s := range subs {
+		if matchesSubscriptionFilter(s, ueIP) {
+			return true
+		}
 	}
-	return sub.Target.UeIPAddress != "" && sub.Target.UeIPAddress == ueIP
+	return false
 }
 
-// scanTimestampRange reads through a Parquet file to find the min/max timestamps.
-func (pd *PseudoDriver) scanTimestampRange(filePath string, sub *Subscription) (minTS, maxTS float64, rowCount int, err error) {
+// scanTimestampRangeBatch finds min/max timestamps across a batch.
+func (pd *PseudoDriver) scanTimestampRangeBatch(filePath string, subs []*Subscription) (minTS, maxTS float64, rowCount int, err error) {
 	f, err := os.Open(filePath)
 	if err != nil {
 		return 0, 0, 0, fmt.Errorf("open parquet file: %w", err)
@@ -336,7 +389,7 @@ func (pd *PseudoDriver) scanTimestampRange(filePath string, sub *Subscription) (
 		if row.UeIP == "" {
 			continue
 		}
-		if !matchesSubscriptionFilter(sub, row.UeIP) {
+		if !matchesAnySubscription(subs, row.UeIP) {
 			continue
 		}
 
@@ -357,12 +410,10 @@ func (pd *PseudoDriver) scanTimestampRange(filePath string, sub *Subscription) (
 	return
 }
 
-// streamAndAccumulate re-reads a Parquet file and accumulates each matching row.
-func (pd *PseudoDriver) streamAndAccumulate(
-	filePath string, sub *Subscription,
+// streamAndAccumulateBatch streams a file once and dispatches rows to multiple sub contexts.
+func (pd *PseudoDriver) streamAndAccumulateBatch(
+	filePath string, contexts []*subContext,
 	minTS, globalTimeOffset, alignedBreakingTime, period float64,
-	phase1Accum, phase2Accum map[windowKey]*counterAccum,
-	uniqueUEs map[string]bool,
 ) (phase1Count, phase2Count int) {
 	f, err := os.Open(filePath)
 	if err != nil {
@@ -385,14 +436,9 @@ func (pd *PseudoDriver) streamAndAccumulate(
 		if row.UeIP == "" {
 			continue
 		}
-		if !matchesSubscriptionFilter(sub, row.UeIP) {
-			continue
-		}
 
 		globalTS := (row.Timestamp - minTS) + globalTimeOffset
 		wIdx := int(math.Floor(globalTS / period))
-		key := windowKey{ueIP: row.UeIP, windowIndex: wIdx}
-		uniqueUEs[row.UeIP] = true
 
 		pkt := parsedPacket{
 			ueIP:      row.UeIP,
@@ -401,11 +447,23 @@ func (pd *PseudoDriver) streamAndAccumulate(
 			isUplink:  row.Direction == "0",
 		}
 
-		if globalTS <= alignedBreakingTime {
-			accumulatePacket(phase1Accum, key, pkt)
+		isP1 := globalTS <= alignedBreakingTime
+
+		for _, ctx := range contexts {
+			if matchesSubscriptionFilter(ctx.sub, row.UeIP) {
+				ctx.uniqueUEs[row.UeIP] = true
+				key := windowKey{ueIP: row.UeIP, windowIndex: wIdx}
+				if isP1 {
+					accumulatePacket(ctx.phase1Accum, key, pkt)
+				} else {
+					accumulatePacket(ctx.phase2Accum, key, pkt)
+				}
+			}
+		}
+
+		if isP1 {
 			phase1Count++
 		} else {
-			accumulatePacket(phase2Accum, key, pkt)
 			phase2Count++
 		}
 	}
@@ -464,12 +522,19 @@ func (pd *PseudoDriver) buildWindowsFromAccum(
 					EndTime:        defaultEndT,
 					UeIpv4Addr:     ueIP,
 				}
+				pd.logger.WithFields(logrus.Fields{
+					"ue":      ueIP,
+					"wIdx":    wIdx,
+					"ulBytes": ca.ulBytes,
+					"dlBytes": ca.dlBytes,
+					"subId":   sub.ID,
+				}).Debug("pseudo driver: window measures extracted from parquet")
 			} else {
 				m = UsageMeasures{
-					Key:            SessionKey{LocalSEID: uint64(wIdx + 1)},
-					StartTime:      defaultStartT,
-					EndTime:        defaultEndT,
-					UeIpv4Addr:     ueIP,
+					Key:        SessionKey{LocalSEID: uint64(wIdx + 1)},
+					StartTime:  defaultStartT,
+					EndTime:    defaultEndT,
+					UeIpv4Addr: ueIP,
 				}
 			}
 			computeThroughputIfPossible(&m)
@@ -521,7 +586,7 @@ func (pd *PseudoDriver) simulateFutureRealTime(sub *Subscription, windows [][]Us
 	for i := startWIdx; i < len(windows); i++ {
 		winMeasures := windows[i]
 
-				if len(winMeasures) > 0 && pd.aggregator != nil {
+		if len(winMeasures) > 0 && pd.aggregator != nil {
 			pd.logger.WithFields(logrus.Fields{
 				"subId":         sub.ID,
 				"windowIndex":   i,
@@ -532,18 +597,31 @@ func (pd *PseudoDriver) simulateFutureRealTime(sub *Subscription, windows [][]Us
 			pd.aggregator.PushLiveMeasures(sub, winMeasures)
 		}
 
-                // Catch-up logic: if real time has already passed this window's EndTime, skip waiting
-                windowEnd := sub.GridAnchor.Add(time.Duration((i+1)*sub.PeriodSec) * time.Second)
+		// Catch-up logic: if real time has already passed this window's EndTime, skip waiting
+		windowEnd := sub.GridAnchor.Add(time.Duration((i+1)*sub.PeriodSec) * time.Second)
 		if time.Now().After(windowEnd) {
-                        pd.logger.Debug("pseudo driver: lagging behind real time, skipping tick wait to catch up")
-                        continue
-                }
+			pd.logger.Debug("pseudo driver: lagging behind real time, skipping tick wait to catch up")
+			continue
+		}
 
-// Wait for the correct number of Aggregator heartbeats
+		// Wait for the correct number of Aggregator heartbeats
 		for t := 0; t < ticksPerWindow; t++ {
 			pd.aggregator.WaitForTick()
 		}
 	}
 
 	pd.logger.WithField("subId", sub.ID).Info("pseudo driver: Phase 2 future simulation completed for subscription")
+}
+
+// matchesSubscriptionFilter checks if a UE IP matches the subscription's target scope.
+func matchesSubscriptionFilter(sub *Subscription, ueIP string) bool {
+	if sub.Target.AnyUE {
+		return true
+	}
+	return sub.Target.UeIPAddress != "" && sub.Target.UeIPAddress == ueIP
+}
+
+// LoadAndReplay is kept for backward compatibility but now calls ScheduleReplay.
+func (pd *PseudoDriver) LoadAndReplay(sub *Subscription) {
+	pd.ScheduleReplay(sub)
 }
