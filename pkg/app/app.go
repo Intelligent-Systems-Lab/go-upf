@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/sirupsen/logrus"
-	"go.uber.org/zap"
 
 	"github.com/free5gc/go-upf/internal/ees"
 	"github.com/free5gc/go-upf/internal/forwarder"
@@ -26,6 +25,7 @@ type UpfApp struct {
 	cfg        *factory.Config
 	driver     forwarder.Driver
 	pfcpServer *pfcp.PfcpServer
+	eesServer  *ees.Server
 }
 
 func NewApp(cfg *factory.Config) (*UpfApp, error) {
@@ -116,6 +116,14 @@ func (u *UpfApp) listenShutdownEvent() {
 	if u.pfcpServer != nil {
 		u.pfcpServer.Stop()
 	}
+	if u.eesServer != nil {
+		// Use a short timeout for API server shutdown
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if err := u.eesServer.Shutdown(shutdownCtx); err != nil {
+			logger.MainLog.Errorf("EES API Server Shutdown Error: %v", err)
+		}
+	}
 	if u.driver != nil {
 		u.driver.Close()
 	}
@@ -169,12 +177,8 @@ func (u *UpfApp) Run() error {
 	if u.cfg.EES != nil && u.cfg.EES.Enabled {
 		logger.MainLog.Infoln("Starting EES Module (Pure Push Mode)...")
 
-		// 1. Create Logger
-		eesLogger, err := zap.NewDevelopment()
-		if err != nil {
-			logger.MainLog.Warnf("Failed to create EES logger: %v", err)
-			eesLogger = zap.NewNop() // Fallback to no-op logger
-		}
+		// 1. Use existing EesLog
+		eesLogger := logger.EesLog
 
 		// 2. Create Store / Notifier / Aggregator
 		subscriptionStore := ees.NewSubscriptionStore("")
@@ -206,7 +210,7 @@ func (u *UpfApp) Run() error {
 
 		// 3. Register EES Handler to Dispatcher
 		eesHandler := ees.NewHandler(aggregator, eesLogger)
-		reportDispatcher.RegisterEESHandler(eesHandler, aggregator) // Pass aggregator for callbacks
+		reportDispatcher.RegisterEESHandler(eesHandler) 
 
 		// Set perioServer for dispatcher callbacks
 		if perioServer != nil {
@@ -230,10 +234,10 @@ func (u *UpfApp) Run() error {
 		if listenAddr == "" {
 			listenAddr = ":8088"
 		}
-		apiServer := ees.NewServer(subscriptionStore, aggregator, eesLogger)
+		u.eesServer = ees.NewServer(subscriptionStore, aggregator, eesLogger)
 
 		go func() {
-			if err := apiServer.Serve(listenAddr); err != nil {
+			if err := u.eesServer.Serve(listenAddr); err != nil {
 				logger.MainLog.Errorf("EES API Server Error: %v", err)
 			}
 		}()
