@@ -67,6 +67,46 @@ sequenceDiagram
 
 ---
 
+## Software Logic Chain
+The following flowchart illustrates the internal function call sequence and logical branching for the Event Exposure Service, mirroring the design style of the `upf-gtp5g` documentation.
+
+```mermaid
+flowchart LR
+    %% Data Source
+    K[gtp5g Kernel] -- "Netlink USA Report" --> F
+
+    subgraph forwarder ["internal/forwarder"]
+        F["gtp5g.go: HandleReport"] -- "parse report" --> D
+    end
+
+    subgraph app ["pkg/app"]
+        D["dispatcher.go: NotifySessReport"]
+    end
+
+    subgraph ees ["internal/ees"]
+        D -- "multicast" --> H["handler.go: NotifySessReport"]
+        H -- "push" --> A["aggregator.go: PushReport"]
+        
+        subgraph processing ["Aggregation Logic"]
+            A -- "SEID lookup" --> IP["node.go: GetSessionContextUEIP"]
+            IP -- "match sub" --> M["aggregator.go: mergeMeasure"]
+            M -- "instant consolidation" --> BUF[("reportBuffer (Map)")]
+        end
+
+        T["aggregator.go: Run (Ticker)"] -- "period elapsed" --> TO["aggregator.go: TickOnce"]
+        BUF -- "fetch consolidated" --> TO
+        TO -- "3GPP formatting" --> N["notifier.go: Notify"]
+    end
+
+    %% External Output
+    N -- "HTTP POST (JSON)" --> C["External Consumer"]
+
+    %% Styling
+    style BUF fill:#f9f,stroke:#333,stroke-width:2px
+```
+
+---
+
 ## Event Exposure Service (EES) Design
 The EES module utilizes a **Pure Push Model**, leveraging existing SMF-provisioned URRs (specifically URR 2 - Measurement After QoS Enforcement) to avoid redundant kernel overhead.
 
