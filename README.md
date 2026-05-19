@@ -23,12 +23,12 @@ The system is divided into three primary layers: the Control Plane (PFCP), the F
 ---
 
 ## System Initialization Chain
-The following diagram illustrates the sequence of function calls during the UPF startup process, highlighting how the Event Exposure Service is integrated into the main application lifecycle.
+The following diagram illustrates the sequence of function calls during the UPF startup process. Components highlighted in **Orange** represent new modules or significant modifications for the Event Exposure Service.
 
 ```mermaid
 graph TD
     Main[main.go] -->|calls| Run[app.go: UpfApp.Run]
-    
+
     subgraph "Forwarding Plane Setup"
         Run --> NewDriver[forwarder.NewDriver]
         NewDriver --> Gtp5g[gtp5g.go: NewGtp5g]
@@ -48,29 +48,32 @@ graph TD
         InitEES --> NewAgg[ees/aggregator.go: NewAggregator]
         InitEES --> NewHdlr[ees/handler.go: NewHandler]
         InitEES --> RegEES[dispatcher.go: RegisterEESHandler]
-        
+
         InitEES -->|goroutine| RunAgg[ees/aggregator.go: Aggregator.Run]
         InitEES -->|goroutine| ServeAPI[ees/api.go: Server.Serve]
     end
 
-    style InitEES fill:#f96,stroke:#333,stroke-width:2px
+    %% Highlight New/Modified Components
+    classDef eesNew fill:#f96,stroke:#333,stroke-width:2px;
+    class InitEES,NewDisp,RegEES,NewStore,NewNotif,NewAgg,NewHdlr,RunAgg,ServeAPI eesNew;
+
     style Run fill:#dfd,stroke:#333
 ```
 
 ---
 
 ## Data Processing Flow: Life of a Usage Report
-The following procedure and sequence diagram describe how traffic measurements are captured and exposed to external Consumers (e.g., NWDAF, PCF).
+The following procedure and sequence diagram describe how traffic measurements are captured and exposed. Components in **Orange** are new EES-specific actors.
 
 ```mermaid
 sequenceDiagram
     participant K as gtp5g (Kernel)
     participant F as Forwarder (Gtp5g Driver)
-    participant D as Dispatcher
+    participant D as Dispatcher #f96
     participant P as PFCP Server
-    participant H as EES Handler
-    participant A as EES Aggregator
-    participant N as EES Notifier
+    participant H as EES Handler #f96
+    participant A as EES Aggregator #f96
+    participant N as EES Notifier #f96
     participant C as Consumer (e.g. NWDAF)
 
     Note over K, F: 1. Periodic/Threshold Trigger
@@ -90,7 +93,6 @@ sequenceDiagram
     N->>C: HTTP POST (TS 29.564 Payload)
     C-->>N: 200 OK / 204 No Content
 ```
-
 1.  **Provisioning Phase**: The SMF initiates a `Session Establishment/Modification Request`.
  The `PFCP Server` (`internal/pfcp/node.go:NewSess`) creates session contexts and provisions rules (PDR/URR) to the `Forwarder Driver`.
 2.  **Detection & Measurement**: The `gtp5g` kernel module matches packets against PDRs and accumulates byte/packet counts in URRs.
