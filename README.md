@@ -22,6 +22,43 @@ The system is divided into three primary layers: the Control Plane (PFCP), the F
 
 ---
 
+## System Initialization Chain
+The following diagram illustrates the sequence of function calls during the UPF startup process, highlighting how the Event Exposure Service is integrated into the main application lifecycle.
+
+```mermaid
+graph TD
+    Main[main.go] -->|calls| Run[app.go: UpfApp.Run]
+    
+    subgraph "Forwarding Plane Setup"
+        Run --> NewDriver[forwarder.NewDriver]
+        NewDriver --> Gtp5g[gtp5g.go: NewGtp5g]
+    end
+
+    subgraph "Control Plane Setup"
+        Run --> NewPFCP[pfcp.NewPfcpServer]
+        Run --> NewDisp[app/dispatcher.go: NewDispatcher]
+        Run --> HandRep[driver.HandleReport]
+        Run --> StartPFCP[pfcp.go: PfcpServer.Start]
+    end
+
+    subgraph "Event Exposure Setup (initEES)"
+        Run --> InitEES[app.go: UpfApp.initEES]
+        InitEES --> NewStore[ees/subscription_store.go: NewSubscriptionStore]
+        InitEES --> NewNotif[ees/notifier.go: NewNotifier]
+        InitEES --> NewAgg[ees/aggregator.go: NewAggregator]
+        InitEES --> NewHdlr[ees/handler.go: NewHandler]
+        InitEES --> RegEES[dispatcher.go: RegisterEESHandler]
+        
+        InitEES -->|goroutine| RunAgg[ees/aggregator.go: Aggregator.Run]
+        InitEES -->|goroutine| ServeAPI[ees/api.go: Server.Serve]
+    end
+
+    style InitEES fill:#f96,stroke:#333,stroke-width:2px
+    style Run fill:#dfd,stroke:#333
+```
+
+---
+
 ## Data Processing Flow: Life of a Usage Report
 The following procedure and sequence diagram describe how traffic measurements are captured and exposed to external Consumers (e.g., NWDAF, PCF).
 
