@@ -68,41 +68,51 @@ sequenceDiagram
 ---
 
 ## Software Logic Chain
-The following flowchart illustrates the internal function call sequence and logical branching for the Event Exposure Service, mirroring the design style of the `upf-gtp5g` documentation.
+The following diagram represents the end-to-end data processing flow for the Event Exposure Service, from kernel-level triggering to the delivery of 3GPP-compliant notifications.
 
 ```mermaid
-flowchart LR
-    %% Data Source
-    K[gtp5g Kernel] -- "Netlink USA Report" --> F
-
-    subgraph forwarder ["internal/forwarder"]
-        F["gtp5g.go: HandleReport"] -- "parse report" --> D
+graph TD
+    %% Kernel Plane
+    subgraph "Data Plane (Kernel / gtp5g)"
+        K1[gtp5g_usage_report] -->|trigger| K2[gtp5g_pdr_usage_report]
+        K2 -->|netlink multicast| K3[Linux Kernel Netlink]
     end
 
-    subgraph app ["pkg/app"]
-        D["dispatcher.go: NotifySessReport"]
+    %% Userspace Forwarder
+    subgraph "Forwarding Plane (internal/forwarder)"
+        K3 -->|read msg| F1[gtp5g.go: HandleReport]
+        F1 -->|parse| F2[gtp5g.go: parseReport]
     end
 
-    subgraph ees ["internal/ees"]
-        D -- "multicast" --> H["handler.go: NotifySessReport"]
-        H -- "push" --> A["aggregator.go: PushReport"]
+    %% Application Dispatcher
+    subgraph "Dispatching Layer (pkg/app)"
+        F2 --> D1[dispatcher.go: NotifySessReport]
+    end
+
+    %% Event Exposure Logic
+    subgraph "Event Exposure Plane (internal/ees)"
+        D1 -->|multicast| H1[handler.go: NotifySessReport]
+        H1 -->|push| A1[aggregator.go: PushReport]
         
-        subgraph processing ["Aggregation Logic"]
-            A -- "SEID lookup" --> IP["node.go: GetSessionContextUEIP"]
-            IP -- "match sub" --> M["aggregator.go: mergeMeasure"]
-            M -- "instant consolidation" --> BUF[("reportBuffer (Map)")]
+        subgraph "Aggregation & Consolidation"
+            A1 --> A2[node.go: GetSessionContextUEIP]
+            A2 --> A3[aggregator.go: mergeMeasure]
+            A3 --> A4[(reportBuffer Map)]
         end
 
-        T["aggregator.go: Run (Ticker)"] -- "period elapsed" --> TO["aggregator.go: TickOnce"]
-        BUF -- "fetch consolidated" --> TO
-        TO -- "3GPP formatting" --> N["notifier.go: Notify"]
+        T1[aggregator.go: Run / Ticker] -->|tick| A5[aggregator.go: TickOnce]
+        A4 -->|fetch| A5
+        A5 -->|format| N1[notifier.go: Notify]
     end
 
-    %% External Output
-    N -- "HTTP POST (JSON)" --> C["External Consumer"]
+    %% External Interface
+    N1 -->|HTTP POST| C1[External Consumer / NWDAF]
 
-    %% Styling
-    style BUF fill:#f9f,stroke:#333,stroke-width:2px
+    %% Styles
+    style K1 fill:#fdd,stroke:#333
+    style D1 fill:#dfd,stroke:#333
+    style A4 fill:#f9f,stroke:#333,stroke-width:2px
+    style C1 fill:#bbf,stroke:#333
 ```
 
 ---
