@@ -23,9 +23,39 @@ The system is divided into three primary layers: the Control Plane (PFCP), the F
 ---
 
 ## Data Processing Flow: Life of a Usage Report
-The following procedure describes how traffic measurements are captured and exposed to external Consumers (e.g., NWDAF, PCF).
+The following procedure and sequence diagram describe how traffic measurements are captured and exposed to external Consumers (e.g., NWDAF, PCF).
 
-1.  **Provisioning Phase**: The SMF initiates a `Session Establishment/Modification Request`. The `PFCP Server` (`internal/pfcp/node.go:NewSess`) creates session contexts and provisions rules (PDR/URR) to the `Forwarder Driver`.
+```mermaid
+sequenceDiagram
+    participant K as gtp5g (Kernel)
+    participant F as Forwarder (Gtp5g Driver)
+    participant D as Dispatcher
+    participant P as PFCP Server
+    participant H as EES Handler
+    participant A as EES Aggregator
+    participant N as EES Notifier
+    participant C as Consumer (e.g. NWDAF)
+
+    Note over K, F: 1. Periodic/Threshold Trigger
+    K->>F: Push Usage Report (URR 2)
+    F->>D: NotifySessReport(sessRpt)
+
+    par Multicast by Dispatcher
+        D->>P: NotifySessReport (to SMF via N4)
+    and
+        D->>H: NotifySessReport
+    end
+
+    H->>A: PushReport (Consolidate immediately)
+
+    Note over A: 2. Subscription Period Elapsed
+    A->>N: Notify(subscription, measures)
+    N->>C: HTTP POST (TS 29.564 Payload)
+    C-->>N: 200 OK / 204 No Content
+```
+
+1.  **Provisioning Phase**: The SMF initiates a `Session Establishment/Modification Request`.
+ The `PFCP Server` (`internal/pfcp/node.go:NewSess`) creates session contexts and provisions rules (PDR/URR) to the `Forwarder Driver`.
 2.  **Detection & Measurement**: The `gtp5g` kernel module matches packets against PDRs and accumulates byte/packet counts in URRs.
 3.  **Report Triggering**: Based on URR thresholds or periodic timers, the kernel pushes a `Usage Report` to the `Forwarder Driver`.
 4.  **Dispatching**: The `Forwarder` (`internal/forwarder/gtp5g.go`) receives the report and invokes `Dispatcher.NotifySessReport`.
