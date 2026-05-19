@@ -63,7 +63,7 @@ graph TD
 ---
 
 ## Data Processing Flow: Life of a Usage Report
-The following procedure and sequence diagram describe how traffic measurements are captured and exposed. The **Orange Box** encapsulates the new components and logic added for EES.
+The following procedure and sequence diagram describe how traffic measurements are captured and exposed. The **Orange Box** highlights the new components added for the Event Exposure Service.
 
 ```mermaid
 sequenceDiagram
@@ -71,7 +71,7 @@ sequenceDiagram
     participant F as Forwarder (Gtp5g Driver)
     participant P as PFCP Server
 
-    box rgb(255, 245, 230) "Event Exposure Module (New)"
+    box rgb(255, 230, 204) "EES Module (New)"
         participant D as Dispatcher
         participant H as EES Handler
         participant A as EES Aggregator
@@ -137,4 +137,3 @@ The EES module utilizes a **Pure Push Model**, leveraging existing SMF-provision
 - **3GPP TS 29.564**: 5G System; User Plane Function Services; Stage 3.
 - **3GPP TS 29.244**: Interface between the Control Plane and the User Plane nodes.
 - **3GPP TS 23.501**: System architecture for the 5G System (5GS).
-.
