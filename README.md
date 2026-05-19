@@ -71,7 +71,7 @@ sequenceDiagram
     participant F as Forwarder (Gtp5g Driver)
     participant P as PFCP Server
 
-    box rgb(255, 230, 204) "EES Module (New)"
+    box #FFE6CC Event Exposure Module (New)
         participant D as Dispatcher
         participant H as EES Handler
         participant A as EES Aggregator
