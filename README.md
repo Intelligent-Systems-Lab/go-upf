@@ -91,7 +91,6 @@ sequenceDiagram
     end
 
     H->>A: PushReport (Consolidate immediately)
-    end
 
     Note over A: 2. Subscription Period Elapsed
     A->>N: Notify(subscription, measures)
