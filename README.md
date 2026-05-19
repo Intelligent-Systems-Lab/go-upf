@@ -64,16 +64,15 @@ graph TD
 
 ## Data Processing Flow: Life of a Usage Report
 The following procedure and sequence diagram describe how traffic measurements are captured and exposed. Components in **Orange** are new EES-specific actors.
-
 ```mermaid
 sequenceDiagram
     participant K as gtp5g (Kernel)
     participant F as Forwarder (Gtp5g Driver)
-    participant D as Dispatcher #orange
+    participant D as Dispatcher #f96
     participant P as PFCP Server
-    participant H as EES Handler #orange
-    participant A as EES Aggregator #orange
-    participant N as EES Notifier #orange
+    participant H as EES Handler #f96
+    participant A as EES Aggregator #f96
+    participant N as EES Notifier #f96
     participant C as Consumer (e.g. NWDAF)
 
     Note over K, F: 1. Periodic/Threshold Trigger
