@@ -95,62 +95,12 @@ sequenceDiagram
  The `PFCP Server` (`internal/pfcp/node.go:NewSess`) creates session contexts and provisions rules (PDR/URR) to the `Forwarder Driver`.
 2.  **Detection & Measurement**: The `gtp5g` kernel module matches packets against PDRs and accumulates byte/packet counts in URRs.
 3.  **Report Triggering**: Based on URR thresholds or periodic timers, the kernel pushes a `Usage Report` to the `Forwarder Driver`.
-4.  **Dispatching**: The `Forwarder` (`internal/forwarder/gtp5g.go`) receives the report and invokes `Dispatcher.NotifySessReport`.
+4.  **Dispatching**: The `Forwarder` (`internal/forwarder/gtp5g.go:HandleReport`) receives the report via Netlink and invokes `Dispatcher.NotifySessReport`.
 5.  **Aggregation**: 
     *   The report is sent to `PFCP Server` for standard N4 reporting to SMF.
-    *   Simultaneously, it is sent to `EES Handler` (`internal/ees/handler.go`), which pushes it to the `Aggregator`.
-6.  **Exposure**: The `Aggregator` (`internal/ees/aggregator.go:TickOnce`) consolidates reports for the subscription period and invokes the `Notifier`.
+    *   Simultaneously, it is sent to `EES Handler` (`internal/ees/handler.go`), which invokes `Aggregator.PushReport`. This triggers an SEID lookup (`node.go:GetSessionContextUEIP`) and instant consolidation using `mergeMeasure`.
+6.  **Exposure**: The `Aggregator` (`internal/ees/aggregator.go:TickOnce`), driven by a background ticker, consolidates reports for the subscription period and invokes the `Notifier`.
 7.  **Delivery**: The `Notifier` (`internal/ees/notifier.go:Notify`) serializes the data into **TS 29.564 NotificationItem** format and performs an HTTP POST to the subscriber's URI.
-
----
-
-## Software Logic Chain
-The following diagram represents the end-to-end data processing flow for the Event Exposure Service, from kernel-level triggering to the delivery of 3GPP-compliant notifications.
-
-```mermaid
-graph TD
-    %% Kernel Plane
-    subgraph "Data Plane (Kernel / gtp5g)"
-        K1[gtp5g_usage_report] -->|trigger| K2[gtp5g_pdr_usage_report]
-        K2 -->|netlink multicast| K3[Linux Kernel Netlink]
-    end
-
-    %% Userspace Forwarder
-    subgraph "Forwarding Plane (internal/forwarder)"
-        K3 -->|read msg| F1[gtp5g.go: HandleReport]
-        F1 -->|parse| F2[gtp5g.go: parseReport]
-    end
-
-    %% Application Dispatcher
-    subgraph "Dispatching Layer (pkg/app)"
-        F2 --> D1[dispatcher.go: NotifySessReport]
-    end
-
-    %% Event Exposure Logic
-    subgraph "Event Exposure Plane (internal/ees)"
-        D1 -->|multicast| H1[handler.go: NotifySessReport]
-        H1 -->|push| A1[aggregator.go: PushReport]
-        
-        subgraph "Aggregation & Consolidation"
-            A1 --> A2[node.go: GetSessionContextUEIP]
-            A2 --> A3[aggregator.go: mergeMeasure]
-            A3 --> A4[(reportBuffer Map)]
-        end
-
-        T1[aggregator.go: Run / Ticker] -->|tick| A5[aggregator.go: TickOnce]
-        A4 -->|fetch| A5
-        A5 -->|format| N1[notifier.go: Notify]
-    end
-
-    %% External Interface
-    N1 -->|HTTP POST| C1[External Consumer / NWDAF]
-
-    %% Styles
-    style K1 fill:#fdd,stroke:#333
-    style D1 fill:#dfd,stroke:#333
-    style A4 fill:#f9f,stroke:#333,stroke-width:2px
-    style C1 fill:#bbf,stroke:#333
-```
 
 ---
 
