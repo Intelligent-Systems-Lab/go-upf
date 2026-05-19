@@ -28,7 +28,7 @@ The following diagram illustrates the sequence of function calls during the UPF 
 ```mermaid
 graph TD
     Main[main.go] -->|calls| Run[app.go: UpfApp.Run]
-    
+
     subgraph "Forwarding Plane Setup"
         Run --> NewDriver[forwarder.NewDriver]
         NewDriver --> Gtp5g[gtp5g.go: NewGtp5g]
@@ -48,7 +48,7 @@ graph TD
         InitEES --> NewAgg[ees/aggregator.go: NewAggregator]
         InitEES --> NewHdlr[ees/handler.go: NewHandler]
         InitEES --> RegEES[dispatcher.go: RegisterEESHandler]
-        
+
         InitEES -->|goroutine| RunAgg[ees/aggregator.go: Aggregator.Run]
         InitEES -->|goroutine| ServeAPI[ees/api.go: Server.Serve]
     end
@@ -56,31 +56,34 @@ graph TD
     %% Highlight New/Modified Components
     classDef eesNew fill:#f96,stroke:#333,stroke-width:2px;
     class InitEES,NewDisp,RegEES,NewStore,NewNotif,NewAgg,NewHdlr,RunAgg,ServeAPI eesNew;
-    
+
     style Run fill:#dfd,stroke:#333
 ```
 
 ---
 
 ## Data Processing Flow: Life of a Usage Report
-The following procedure and sequence diagram describe how traffic measurements are captured and exposed. Components in **Orange** are new EES-specific actors.
+The following procedure and sequence diagram describe how traffic measurements are captured and exposed. The **Orange Box** encapsulates the new components and logic added for EES.
+
 ```mermaid
 sequenceDiagram
     participant K as gtp5g (Kernel)
     participant F as Forwarder (Gtp5g Driver)
-    participant D as Dispatcher #f96
     participant P as PFCP Server
-    participant H as EES Handler #f96
-    participant A as EES Aggregator #f96
-    participant N as EES Notifier #f96
+
+    box rgb(255, 245, 230) "Event Exposure Module (New)"
+        participant D as Dispatcher
+        participant H as EES Handler
+        participant A as EES Aggregator
+        participant N as EES Notifier
+    end
+
     participant C as Consumer (e.g. NWDAF)
 
     Note over K, F: 1. Periodic/Threshold Trigger
     K->>F: Push Usage Report (URR 2)
     F->>D: NotifySessReport(sessRpt)
-    
-    rect rgb(255, 240, 230)
-    Note right of D: EES Multicast Range
+
     par Multicast by Dispatcher
         D->>P: NotifySessReport (to SMF via N4)
     and
@@ -89,7 +92,7 @@ sequenceDiagram
 
     H->>A: PushReport (Consolidate immediately)
     end
-    
+
     Note over A: 2. Subscription Period Elapsed
     A->>N: Notify(subscription, measures)
     N->>C: HTTP POST (TS 29.564 Payload)
@@ -135,3 +138,4 @@ The EES module utilizes a **Pure Push Model**, leveraging existing SMF-provision
 - **3GPP TS 29.564**: 5G System; User Plane Function Services; Stage 3.
 - **3GPP TS 29.244**: Interface between the Control Plane and the User Plane nodes.
 - **3GPP TS 23.501**: System architecture for the 5G System (5GS).
+.
