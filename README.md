@@ -26,6 +26,10 @@ The system is divided into three primary layers: the Control Plane (PFCP), the F
 The following diagram illustrates the sequence of function calls during the UPF startup process. Components highlighted in **Orange** represent new modules or significant modifications for the Event Exposure Service.
 
 ```mermaid
+---
+config:
+  layout: elk
+---
 graph TD
     Main[main.go] -->|calls| Run[app.go: UpfApp.Run]
 
