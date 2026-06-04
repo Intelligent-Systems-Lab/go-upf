@@ -30,12 +30,6 @@ type PerioServerInterface interface {
 	GetAnyURRPeriod(urrid uint32) time.Duration
 }
 
-// SessionProvider provides access to session contexts
-type SessionProvider interface {
-	GetSessionContexts() map[uint64]SessionContext
-	GetSessionContextUEIP(lSeid uint64) (string, bool)
-}
-
 type Aggregator struct {
 	subscriptionStore *SubscriptionStore
 	reportPeriod      time.Duration
@@ -46,6 +40,9 @@ type Aggregator struct {
 	mu sync.Mutex
 	// [Push Mode] Consolidated reports per subscription: Key=SubscriptionID, SubKey=SessionKey
 	reportBuffer map[string]map[SessionKey]*UsageMeasures
+
+	// [Push Mode] Mutex protects TickOnce from concurrent execution
+	tickMu sync.Mutex
 
 	sessionProvider SessionProvider      // Added: to lookup UE IP
 	perioServer     PerioServerInterface // Added: to query URR periods
@@ -143,6 +140,10 @@ func (aggregator *Aggregator) getTicker() *time.Ticker {
 func (aggregator *Aggregator) TickOnce(ctx context.Context) (int, error) {
 	_ = ctx // ctx reserved for future cancellation support
 
+	// Prevent concurrent TickOnce executions
+	aggregator.tickMu.Lock()
+	defer aggregator.tickMu.Unlock()
+
 	now := time.Now()
 	totalNotifications := 0
 
@@ -159,15 +160,50 @@ func (aggregator *Aggregator) TickOnce(ctx context.Context) (int, error) {
 	subscriptions := aggregator.subscriptionStore.AllSubscriptions()
 
 	for _, subscription := range subscriptions {
+		// Use subscription mutex for field access
+		subscription.mu.Lock()
+		
 		// MVP scope: only USER_DATA_USAGE_MEASURES + perPduSession
 		if subscription.Event != EventUserDataUsageMeasures ||
 			subscription.Granularity != GranularityPerSession {
+			subscription.mu.Unlock()
 			continue
 		}
 
 		// Get consolidated reports for this subscription
 		sessionMap, hasReports := bufferedReports[subscription.ID]
+		
+		// [Special Case] For ONE_TIME (OnDemand) mode, if there is no data in buffer, 
+		// we MUST send a zero-value report to fulfill the "immediate" requirement 
+		// and then delete the subscription.
+		if subscription.Mode == ModeOnDemand && (!hasReports || len(sessionMap) == 0) {
+			aggregator.logger.Infof("ees ONE_TIME subscription %s has no buffered data, sending zero-value report", subscription.ID)
+			
+			// Try to find active sessions for this UE to provide at least some identity info
+			zeroReports := aggregator.generateZeroReports(subscription)
+			
+			// We can unlock while calling Notifier as it only uses immutable fields or local variables
+			subscription.mu.Unlock()
+			
+			if len(zeroReports) > 0 {
+				if err := aggregator.notifier.Notify(subscription, zeroReports); err != nil {
+					aggregator.logger.Warnf("ees failed to send zero-value ONE_TIME report: %v", err)
+					// Keep in store for retry next tick (will be zero again if no data)
+					continue 
+				}
+				totalNotifications++
+			} else {
+				aggregator.logger.Warnf("ees ONE_TIME subscription %s: no active sessions found for targeting, skipping notification", subscription.ID)
+			}
+			
+			// Implicit delete after "attempting" to report (or if no sessions exist to report on)
+			_ = aggregator.subscriptionStore.DeleteSubscription(subscription.ID)
+			aggregator.logger.Infof("ees ONE_TIME subscription %s implicitly deleted (empty/zero path)", subscription.ID)
+			continue
+		}
+
 		if !hasReports || len(sessionMap) == 0 {
+			subscription.mu.Unlock()
 			continue
 		}
 
@@ -186,6 +222,7 @@ func (aggregator *Aggregator) TickOnce(ctx context.Context) (int, error) {
 					mergeMeasure(aggregator.reportBuffer[subscription.ID], v)
 				}
 				aggregator.mu.Unlock()
+				subscription.mu.Unlock()
 				continue
 			}
 		}
@@ -196,6 +233,9 @@ func (aggregator *Aggregator) TickOnce(ctx context.Context) (int, error) {
 			computeThroughputIfPossible(m)
 			consolidatedList = append(consolidatedList, *m)
 		}
+
+		// Unlock during network call
+		subscription.mu.Unlock()
 
 		// Perform notification
 		if err := aggregator.notifier.Notify(subscription, consolidatedList); err != nil {
@@ -221,8 +261,21 @@ func (aggregator *Aggregator) TickOnce(ctx context.Context) (int, error) {
 			}).Info("ees notification sent successfully")
 
 			// Update last notify time
+			subscription.mu.Lock()
 			subscription.LastNotify = now
+			subscription.mu.Unlock()
+			
 			totalNotifications++
+
+			// 3GPP TS 29.564: ONE_TIME subscriptions are deleted implicitly after reporting.
+			if subscription.Mode == ModeOnDemand {
+				if err := aggregator.subscriptionStore.DeleteSubscription(subscription.ID); err != nil {
+					aggregator.logger.Warnf("ees failed to implicitly delete ONE_TIME subscription %s: %v",
+						subscription.ID, err)
+				} else {
+					aggregator.logger.Infof("ees ONE_TIME subscription %s implicitly deleted", subscription.ID)
+				}
+			}
 		}
 	}
 
@@ -363,6 +416,29 @@ func (aggregator *Aggregator) PushReport(sessRpt report.SessReport) {
 			"urrCount":       reportCount,
 		}).Debug("ees smf urr report captured and consolidated")
 	}
+}
+
+func (aggregator *Aggregator) generateZeroReports(sub *Subscription) []UsageMeasures {
+	var reports []UsageMeasures
+	if aggregator.sessionProvider == nil {
+		return reports
+	}
+
+	sessions := aggregator.sessionProvider.GetSessionContexts()
+	now := time.Now()
+
+	for lSeid, ctx := range sessions {
+		if aggregator.matchesSubscription(sub, ctx.UeIPv4Addr) {
+			reports = append(reports, UsageMeasures{
+				Key:        SessionKey{LocalSEID: lSeid, RemoteSEID: ctx.RemoteSEID},
+				StartTime:  now.Add(-1 * time.Second), // minimal interval for zero report
+				EndTime:    now,
+				UeIpv4Addr: ctx.UeIPv4Addr,
+				// All counter fields default to 0
+			})
+		}
+	}
+	return reports
 }
 
 func (aggregator *Aggregator) matchesSubscription(sub *Subscription, ueIpv4Addr string) bool {

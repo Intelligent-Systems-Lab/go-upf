@@ -3,7 +3,10 @@
 
 package ees
 
-import "time"
+import (
+	"sync"
+	"time"
+)
 
 // EventType enumerates EES event IDs supported by the UPF.
 // MVP only: USER_DATA_USAGE_MEASURES.
@@ -154,6 +157,7 @@ type UsageMeasures struct {
 
 // Subscription holds the in-memory state for a single EES subscription.
 type Subscription struct {
+	mu                  sync.RWMutex
 	ID                  string
 	NotifURI            string
 	NotifyCorrelationID string // Added: Client-provided correlation ID
@@ -213,4 +217,5 @@ type SessionContext struct {
 // Used by API Server for provisioning Shadow URRs to all active sessions.
 type SessionProvider interface {
 	GetSessionContexts() map[uint64]SessionContext
+	GetSessionContextUEIP(lSeid uint64) (string, bool)
 }

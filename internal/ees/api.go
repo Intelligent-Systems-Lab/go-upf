@@ -141,14 +141,19 @@ func (server *Server) handleCreateSubscription(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	id := server.subscriptionStore.Add(subscriptionCandidate)
+	id, err := server.subscriptionStore.CreateSubscription(subscriptionCandidate)
+	if err != nil {
+		server.logger.Warnf("subscription store failed: %v", err)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
 	server.logger.Infof("ees subscription created: id=%s nfId=%s trigger=%s",
 		id, inboundRequest.Subscription.NfID, inboundRequest.Subscription.EventReportingMode.Trigger)
 
 	// If Mode is ON_DEMAND, trigger an immediate tick in the aggregator.
 	if subscriptionCandidate.Mode == ModeOnDemand {
 		server.logger.Infof("ees immediate tick triggered for subscriptionId=%s", id)
-		go server.aggregator.TickOnce()
+		go server.aggregator.TickOnce(context.Background())
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -166,7 +171,8 @@ func (server *Server) handleDeleteSubscriptionByID(w http.ResponseWriter, r *htt
 		return
 	}
 
-	parts := strings.Split(r.URL.Path, "/")
+	path := strings.TrimSuffix(r.URL.Path, "/")
+	parts := strings.Split(path, "/")
 	if len(parts) < 4 {
 		http.Error(w, "not found", http.StatusNotFound)
 		return
@@ -177,7 +183,7 @@ func (server *Server) handleDeleteSubscriptionByID(w http.ResponseWriter, r *htt
 		return
 	}
 
-	if removed := server.subscriptionStore.Remove(id); removed {
+	if err := server.subscriptionStore.DeleteSubscription(id); err == nil {
 		server.logger.Infof("ees subscription deleted: id=%s", id)
 		w.WriteHeader(http.StatusNoContent)
 	} else {
@@ -218,12 +224,16 @@ func (server *Server) validateAndMapRequest(req createSubscriptionRequest) (*Sub
 	return &Subscription{
 		Event:            EventType(e.Type),
 		NotifURI:         sub.EventNotifyURI,
+		NotifyCorrelationID: sub.NotifyCorrelationID,
+		NfID:             sub.NfID,
 		Granularity:      Granularity(e.GranularityOfMeasurement),
 		Mode:             mode,
 		PeriodSec:        sub.EventReportingMode.ReportPeriod,
 		MeasurementTypes: mTypes,
-		TargetUE:         sub.UeIPAddress,
-		AnyUE:            sub.AnyUE,
+		Target: TargetScope{
+			UeIPAddress: sub.UeIPAddress,
+			AnyUE:       sub.AnyUE,
+		},
 		Snapshots:        make(map[SessionKey]Counters),
 	}, nil
 }
