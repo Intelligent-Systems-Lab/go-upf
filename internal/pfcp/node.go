@@ -3,6 +3,7 @@ package pfcp
 import (
 	"fmt"
 	"net"
+	"sync"
 
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"

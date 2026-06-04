@@ -122,10 +122,10 @@ func (notifier *Notifier) Notify(subscription *Subscription, measures []UsageMea
 			// Conditionally add Throughput Measurement
 			if subscription.HasMeasurementType(MeasureThroughput) {
 				measurement.ThroughputMeasurement = &ThroughputMeasurement{
-					UlThroughput:       fmt.Sprintf("%d bps", m.ULThroughput),
-					DlThroughput:       fmt.Sprintf("%d bps", m.DLThroughput),
-					UlPacketThroughput: fmt.Sprintf("%d pps", m.ULPacketThroughput),
-					DlPacketThroughput: fmt.Sprintf("%d pps", m.DLPacketThroughput),
+					UlThroughput:       fmt.Sprintf("%.0f bps", m.ULThroughputBps),
+					DlThroughput:       fmt.Sprintf("%.0f bps", m.DLThroughputBps),
+					UlPacketThroughput: fmt.Sprintf("%.2f pps", m.ULPacketThroughputPps),
+					DlPacketThroughput: fmt.Sprintf("%.2f pps", m.DLPacketThroughputPps),
 				}
 			}
 
@@ -137,7 +137,7 @@ func (notifier *Notifier) Notify(subscription *Subscription, measures []UsageMea
 
 	payload := NotificationData{
 		NotificationItems: notificationItems,
-		CorrelationId:     subscription.ID, // Simple correlation for MVP
+		CorrelationId:     subscription.NotifyCorrelationID,
 	}
 
 	bodyBytes, err := json.Marshal(payload)
