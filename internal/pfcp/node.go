@@ -3,6 +3,7 @@ package pfcp
 import (
 	"fmt"
 	"net"
+	"sync"
 
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
@@ -675,9 +676,13 @@ func (n *RemoteNode) DeleteSess(lSeid uint64) []report.USAReport {
 type LocalNode struct {
 	sess []*Sess
 	free []uint64
+	mu   sync.RWMutex
 }
 
 func (n *LocalNode) Reset() {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
 	for _, sess := range n.sess {
 		if sess != nil {
 			sess.Close()
@@ -691,6 +696,9 @@ func (n *LocalNode) Sess(lSeid uint64) (*Sess, error) {
 	if lSeid == 0 {
 		return nil, errors.New("Sess: invalid lSeid:0")
 	}
+
+	n.mu.RLock()
+	defer n.mu.RUnlock()
 
 	// Length as int; compare as uint64 to match lSeid type.
 	sessLen := len(n.sess)
@@ -708,8 +716,11 @@ func (n *LocalNode) Sess(lSeid uint64) (*Sess, error) {
 }
 
 func (n *LocalNode) RemoteSess(rSeid uint64, addr net.Addr) (*Sess, error) {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+
 	for _, s := range n.sess {
-		if s.RemoteID == rSeid && s.rnode.addr.String() == addr.String() {
+		if s != nil && s.RemoteID == rSeid && s.rnode.addr.String() == addr.String() {
 			return s, nil
 		}
 	}
@@ -717,6 +728,9 @@ func (n *LocalNode) RemoteSess(rSeid uint64, addr net.Addr) (*Sess, error) {
 }
 
 func (n *LocalNode) NewSess(rSeid uint64, qlen int) *Sess {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
 	s := &Sess{
 		RemoteID: rSeid,
 		PDRIDs:   make(map[uint16]*PDRInfo),
@@ -744,6 +758,9 @@ func (n *LocalNode) DeleteSess(lSeid uint64) ([]report.USAReport, error) {
 		return nil, errors.New("DeleteSess: invalid lSeid:0")
 	}
 
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
 	// Capacity as int; compare as uint64 to match lSeid type.
 	sessCap := len(n.sess)
 	if lSeid > uint64(sessCap) {
@@ -764,11 +781,24 @@ func (n *LocalNode) DeleteSess(lSeid uint64) ([]report.USAReport, error) {
 	return usars, nil
 }
 
+// GetSessionContextUEIP returns the UE IPv4 address for a given SEID.
+// This is more efficient than GetSessionContexts when only the IP is needed.
+func (n *LocalNode) GetSessionContextUEIP(lSeid uint64) (string, bool) {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+
+	idx := int(lSeid) - 1
+	if idx < 0 || idx >= len(n.sess) || n.sess[idx] == nil {
+		return "", false
+	}
+	return n.sess[idx].UeIPv4Addr, true
+}
+
 // [New] Implement ees.SessionProvider interface
 // Allow EES to obtain the context of active Sessions (RemoteSEID and URRIDs)
 func (n *LocalNode) GetSessionContexts() map[uint64]ees.SessionContext {
-	// If concurrency safety is needed, it is recommended to add a lock here (n.sess may change during operation)
-	// But for MVP, if there is no high-risk scenario of concurrent Session deletion, it can be omitted temporarily
+	n.mu.RLock()
+	defer n.mu.RUnlock()
 
 	result := make(map[uint64]ees.SessionContext)
 
