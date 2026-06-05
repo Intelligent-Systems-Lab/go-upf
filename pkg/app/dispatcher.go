@@ -35,14 +35,14 @@ func (d *Dispatcher) RegisterEESHandler(handler report.Handler) {
 // NotifySessReport multicasts the report to all registered handlers.
 // Pure Push Mode: All USAReports are forwarded to both handlers.
 // - PFCP handler: forwards to SMF (N4)
-// - EES handler: aggregates for event exposure (filters URRID >= 7 internally)
+// - EES handler: aggregates for event exposure (filters URRID == 2 internally)
 func (d *Dispatcher) NotifySessReport(sessRpt report.SessReport) {
 	// Dispatch to PFCP (N4) - all reports
 	if d.pfcpHandler != nil {
 		d.pfcpHandler.NotifySessReport(sessRpt)
 	}
 
-	// Dispatch to EES - all reports (EES aggregator filters by URRID >= 7)
+	// Dispatch to EES - all reports (EES aggregator filters by URRID == 2)
 	if d.eesHandler != nil {
 		d.eesHandler.NotifySessReport(sessRpt)
 	}
