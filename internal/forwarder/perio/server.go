@@ -159,10 +159,7 @@ func (s *Server) Serve(wg *sync.WaitGroup) {
 				s.perioList[e.period] = perioGroup
 			}
 
-			// Trigger callback for EES period adjustment
-			if s.onURRAdded != nil {
-				s.onURRAdded(e.urrid, e.period)
-			}
+			cb := s.onURRAdded
 
 			urrids := perioGroup.urrids[e.lSeid]
 			if urrids == nil {
@@ -175,6 +172,11 @@ func (s *Server) Serve(wg *sync.WaitGroup) {
 				}
 			}
 			s.mu.Unlock()
+
+			// Trigger callback for EES period adjustment outside the lock
+			if cb != nil {
+				cb(e.urrid, e.period)
+			}
 		case TYPE_PERIO_DEL:
 			s.mu.Lock()
 			for period, perioGroup := range s.perioList {

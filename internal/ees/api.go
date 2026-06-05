@@ -143,19 +143,28 @@ func (server *Server) handleCreateSubscription(w http.ResponseWriter, r *http.Re
 
 	id, err := server.subscriptionStore.CreateSubscription(subscriptionCandidate)
 	if err != nil {
+		status := http.StatusInternalServerError
+		if errors.Is(err, ErrInvalidSubscription) {
+			status = http.StatusBadRequest
+		}
 		server.logger.Warnf("subscription store failed: %v", err)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		http.Error(w, err.Error(), status)
 		return
 	}
 	server.logger.Infof("ees subscription created: id=%s nfId=%s trigger=%s",
 		id, inboundRequest.Subscription.NfID, inboundRequest.Subscription.EventReportingMode.Trigger)
 
 	// If Mode is ON_DEMAND, trigger an immediate tick in the aggregator.
-	if subscriptionCandidate.Mode == ModeOnDemand {
+	if subscriptionCandidate.Mode == ModeOnDemand && server.aggregator != nil {
 		server.logger.Infof("ees immediate tick triggered for subscriptionId=%s", id)
-		go server.aggregator.TickOnce(context.Background())
+		go func() {
+			if _, tickErr := server.aggregator.TickOnce(context.Background()); tickErr != nil {
+				server.logger.Warnf("ees on-demand immediate tick failed for subscriptionId=%s: %v", id, tickErr)
+			}
+		}()
 	}
 
+	w.Header().Set("Location", "/nupf-ee/v1/ee-subscriptions/"+id)
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
 	_ = json.NewEncoder(w).Encode(createSubscriptionResponse{
@@ -211,14 +220,30 @@ func (server *Server) validateAndMapRequest(req createSubscriptionRequest) (*Sub
 		return nil, fmt.Errorf("unsupported granularity: %s (MVP only supports PER_SESSION)", e.GranularityOfMeasurement)
 	}
 
-	mode := ModePeriodic
-	if sub.EventReportingMode.Trigger == "ONE_TIME" {
+	var mode Mode
+	switch strings.ToUpper(sub.EventReportingMode.Trigger) {
+	case "PERIODIC":
+		mode = ModePeriodic
+	case "ONE_TIME":
 		mode = ModeOnDemand
+	default:
+		return nil, fmt.Errorf("unsupported trigger: %s", sub.EventReportingMode.Trigger)
 	}
 
 	mTypes := make([]MeasurementType, 0, len(e.MeasurementTypes))
 	for _, mt := range e.MeasurementTypes {
-		mTypes = append(mTypes, MeasurementType(mt))
+		mtStr := MeasurementType(strings.ToUpper(string(mt)))
+		if mtStr != MeasureVolume && mtStr != MeasureThroughput && mtStr != MeasureAppInfo {
+			return nil, fmt.Errorf("unsupported measurementType: %s", mt)
+		}
+		mTypes = append(mTypes, mtStr)
+	}
+
+	if sub.AnyUE && sub.UeIPAddress != "" {
+		return nil, errors.New("cannot specify both anyUe and ueIpAddress")
+	}
+	if !sub.AnyUE && sub.UeIPAddress == "" {
+		return nil, errors.New("must specify either anyUe or ueIpAddress")
 	}
 
 	return &Subscription{
