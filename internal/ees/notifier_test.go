@@ -58,9 +58,14 @@ func TestNotifier_Notify(t *testing.T) {
 			// Check correlationId field in JSON body
 			Filter(func(req *http.Request) bool {
 				var data map[string]interface{}
-				body, _ := io.ReadAll(req.Body)
+				body, err := io.ReadAll(req.Body)
+				if err != nil {
+					return false
+				}
 				req.Body = io.NopCloser(bytes.NewBuffer(body))
-				json.Unmarshal(body, &data)
+				if err := json.Unmarshal(body, &data); err != nil {
+					return false
+				}
 				return data["correlationId"] == "corr-123"
 			}).
 			Reply(204)
@@ -70,7 +75,7 @@ func TestNotifier_Notify(t *testing.T) {
 		assert.True(t, gock.IsDone())
 	})
 
-    t.Run("HandleHttpError", func(t *testing.T) {
+	t.Run("HandleHttpError", func(t *testing.T) {
 		gock.New("http://subscriber:8080").
 			Post("/callback").
 			Reply(500).

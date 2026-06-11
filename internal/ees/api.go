@@ -167,10 +167,12 @@ func (server *Server) handleCreateSubscription(w http.ResponseWriter, r *http.Re
 	w.Header().Set("Location", "/nupf-ee/v1/ee-subscriptions/"+id)
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
-	_ = json.NewEncoder(w).Encode(createSubscriptionResponse{
+	if encodeErr := json.NewEncoder(w).Encode(createSubscriptionResponse{
 		Subscription:   inboundRequest.Subscription,
 		SubscriptionID: id,
-	})
+	}); encodeErr != nil {
+		server.logger.Errorf("failed to encode response: %v", encodeErr)
+	}
 }
 
 // handleDeleteSubscriptionByID handles DELETE /nupf-ee/v1/ee-subscriptions/{id}
@@ -232,7 +234,7 @@ func (server *Server) validateAndMapRequest(req createSubscriptionRequest) (*Sub
 
 	mTypes := make([]MeasurementType, 0, len(e.MeasurementTypes))
 	for _, mt := range e.MeasurementTypes {
-		mtStr := MeasurementType(strings.ToUpper(string(mt)))
+		mtStr := MeasurementType(strings.ToUpper(mt))
 		if mtStr != MeasureVolume && mtStr != MeasureThroughput && mtStr != MeasureAppInfo {
 			return nil, fmt.Errorf("unsupported measurementType: %s", mt)
 		}
@@ -247,18 +249,18 @@ func (server *Server) validateAndMapRequest(req createSubscriptionRequest) (*Sub
 	}
 
 	return &Subscription{
-		Event:            EventType(e.Type),
-		NotifURI:         sub.EventNotifyURI,
+		Event:               EventType(e.Type),
+		NotifURI:            sub.EventNotifyURI,
 		NotifyCorrelationID: sub.NotifyCorrelationID,
-		NfID:             sub.NfID,
-		Granularity:      Granularity(e.GranularityOfMeasurement),
-		Mode:             mode,
-		PeriodSec:        sub.EventReportingMode.ReportPeriod,
-		MeasurementTypes: mTypes,
+		NfID:                sub.NfID,
+		Granularity:         Granularity(e.GranularityOfMeasurement),
+		Mode:                mode,
+		PeriodSec:           sub.EventReportingMode.ReportPeriod,
+		MeasurementTypes:    mTypes,
 		Target: TargetScope{
 			UeIPAddress: sub.UeIPAddress,
 			AnyUE:       sub.AnyUE,
 		},
-		Snapshots:        make(map[SessionKey]Counters),
+		Snapshots: make(map[SessionKey]Counters),
 	}, nil
 }
