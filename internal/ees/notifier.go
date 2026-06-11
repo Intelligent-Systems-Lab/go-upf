@@ -129,7 +129,9 @@ func (notifier *Notifier) Notify(subscription *Subscription, measures []UsageMea
 				}
 			}
 
-			if measurement.VolumeMeasurement == nil && measurement.ThroughputMeasurement == nil && measurement.ThroughputStatisticsMeasurement == nil {
+			if measurement.VolumeMeasurement == nil &&
+				measurement.ThroughputMeasurement == nil &&
+				measurement.ThroughputStatisticsMeasurement == nil {
 				return fmt.Errorf("notify: subscriptionId=%s has no supported measurementTypes", subscription.ID)
 			}
 			item.UserDataUsageMeasurements = append(item.UserDataUsageMeasurements, measurement)

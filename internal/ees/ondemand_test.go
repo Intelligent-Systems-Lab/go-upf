@@ -38,12 +38,12 @@ func TestModeOnDemandLifecycle(t *testing.T) {
 		aggregator.mu.Lock()
 		aggregator.reportBuffer[id] = map[SessionKey]*UsageMeasures{
 			{LocalSEID: 1}: {
-				Key:            SessionKey{LocalSEID: 1},
-				ULBytesDelta:   100,
-				DLBytesDelta:   200,
-				StartTime:      time.Now().Add(-5 * time.Second),
-				EndTime:        time.Now(),
-				UeIpv4Addr:     "10.0.0.1",
+				Key:          SessionKey{LocalSEID: 1},
+				ULBytesDelta: 100,
+				DLBytesDelta: 200,
+				StartTime:    time.Now().Add(-5 * time.Second),
+				EndTime:      time.Now(),
+				UeIpv4Addr:   "10.0.0.1",
 			},
 		}
 		aggregator.mu.Unlock()
@@ -86,7 +86,9 @@ func TestModeOnDemandLifecycle(t *testing.T) {
 				UeIPAddress: "10.60.0.1",
 			},
 		}
-		id2, _ := store.CreateSubscription(sub2)
+		id2, err := store.CreateSubscription(sub2)
+		require.NoError(t, err)
+		_ = id2 // id2 is used implicitly via store lookup in TickOnce
 
 		// Mock the callback for zero report
 		gock.New("http://subscriber:8080").

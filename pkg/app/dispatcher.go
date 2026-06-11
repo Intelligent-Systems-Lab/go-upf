@@ -46,7 +46,6 @@ func (d *Dispatcher) NotifySessReport(sessRpt report.SessReport) {
 	if d.eesHandler != nil {
 		d.eesHandler.NotifySessReport(sessRpt)
 	}
-
 }
 
 // PopBufPkt delegates buffering logic exclusively to the PFCP handler.

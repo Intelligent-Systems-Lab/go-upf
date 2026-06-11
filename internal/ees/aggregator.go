@@ -162,7 +162,7 @@ func (aggregator *Aggregator) TickOnce(ctx context.Context) (int, error) {
 	for _, subscription := range subscriptions {
 		// Use subscription mutex for field access
 		subscription.mu.Lock()
-		
+
 		// MVP scope: only USER_DATA_USAGE_MEASURES + perPduSession
 		if subscription.Event != EventUserDataUsageMeasures ||
 			subscription.Granularity != GranularityPerSession {
@@ -172,36 +172,38 @@ func (aggregator *Aggregator) TickOnce(ctx context.Context) (int, error) {
 
 		// Get consolidated reports for this subscription
 		sessionMap, hasReports := bufferedReports[subscription.ID]
-		
-		// [Special Case] For ONE_TIME (OnDemand) mode, if there is no data in buffer, 
-		// we MUST send a zero-value report to fulfill the "immediate" requirement 
+
+		// [Special Case] For ONE_TIME (OnDemand) mode, if there is no data in buffer,
+		// we MUST send a zero-value report to fulfill the "immediate" requirement
 		// and then delete the subscription.
 		if subscription.Mode == ModeOnDemand && (!hasReports || len(sessionMap) == 0) {
 			aggregator.logger.Infof("ees ONE_TIME subscription %s has no buffered data, sending zero-value report", subscription.ID)
-			
+
 			// Try to find active sessions for this UE to provide at least some identity info
 			zeroReports := aggregator.generateZeroReports(subscription)
-			
+
 			// We can unlock while calling Notifier as it only uses immutable fields or local variables
 			subscription.mu.Unlock()
-			
+
 			if len(zeroReports) > 0 {
 				if err := aggregator.notifier.Notify(subscription, zeroReports); err != nil {
 					aggregator.logger.Warnf("ees failed to send zero-value ONE_TIME report: %v", err)
 					// Keep in store for retry next tick (will be zero again if no data)
-					continue 
+					continue
 				}
 				totalNotifications++
 			} else {
-				aggregator.logger.Warnf("ees ONE_TIME subscription %s: no active sessions found for targeting, skipping notification", subscription.ID)
+				aggregator.logger.Warnf("ees ONE_TIME sub %s: no active sessions, skipping notification",
+					subscription.ID)
 			}
-			
+
 			// Implicit delete after "attempting" to report (or if no sessions exist to report on)
-			_ = aggregator.subscriptionStore.DeleteSubscription(subscription.ID)
+			if err := aggregator.subscriptionStore.DeleteSubscription(subscription.ID); err != nil {
+				aggregator.logger.Warnf("ees failed to delete ONE_TIME sub %s: %v", subscription.ID, err)
+			}
 			aggregator.logger.Infof("ees ONE_TIME subscription %s implicitly deleted (empty/zero path)", subscription.ID)
 			continue
 		}
-
 		if !hasReports || len(sessionMap) == 0 {
 			subscription.mu.Unlock()
 			continue
@@ -264,7 +266,7 @@ func (aggregator *Aggregator) TickOnce(ctx context.Context) (int, error) {
 			subscription.mu.Lock()
 			subscription.LastNotify = now
 			subscription.mu.Unlock()
-			
+
 			totalNotifications++
 
 			// 3GPP TS 29.564: ONE_TIME subscriptions are deleted implicitly after reporting.
@@ -306,29 +308,6 @@ func mergeMeasure(m map[SessionKey]*UsageMeasures, newM *UsageMeasures) {
 	if existing.UeIpv4Addr == "" {
 		existing.UeIpv4Addr = newM.UeIpv4Addr
 	}
-}
-
-// consolidateReports merges multiple UsageMeasures for the same session into one.
-// [DEPRECATED] consolidated reports are now merged directly into maps.
-func consolidateReports(reports []UsageMeasures) []UsageMeasures {
-	if len(reports) <= 1 {
-		return reports
-	}
-
-	consolidated := make(map[SessionKey]*UsageMeasures)
-
-	for _, r := range reports {
-		rCopy := r
-		mergeMeasure(consolidated, &rCopy)
-	}
-
-	result := make([]UsageMeasures, 0, len(consolidated))
-	for _, m := range consolidated {
-		computeThroughputIfPossible(m)
-		result = append(result, *m)
-	}
-
-	return result
 }
 
 // PushReport handles unsolicited reports (e.g. from Kernel via Handler).
@@ -402,7 +381,7 @@ func (aggregator *Aggregator) PushReport(sessRpt report.SessReport) {
 		if _, ok := aggregator.reportBuffer[sub.ID]; !ok {
 			aggregator.reportBuffer[sub.ID] = make(map[SessionKey]*UsageMeasures)
 		}
-		
+
 		// Create a copy for this subscription since mergeMeasure might modify it
 		mCopy := *m
 		mergeMeasure(aggregator.reportBuffer[sub.ID], &mCopy)
