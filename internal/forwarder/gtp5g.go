@@ -1356,7 +1356,6 @@ func (g *Gtp5g) UpdateURR(lSeid uint64, req *ie.IE) ([]report.USAReport, error) 
 			StartTime:   r.StartTime,
 			EndTime:     r.EndTime,
 		}
-
 		usar.USARTrigger.Flags = r.USARTrigger
 		usar.VolumMeasure = report.VolumeMeasure{
 			TotalVolume:    r.VolMeasurement.TotalVolume,
@@ -1400,7 +1399,6 @@ func (g *Gtp5g) RemoveURR(lSeid uint64, req *ie.IE) ([]report.USAReport, error) 
 			StartTime:   r.StartTime,
 			EndTime:     r.EndTime,
 		}
-
 		usar.USARTrigger.Flags = r.USARTrigger
 		usar.VolumMeasure = report.VolumeMeasure{
 			TotalVolume:    r.VolMeasurement.TotalVolume,

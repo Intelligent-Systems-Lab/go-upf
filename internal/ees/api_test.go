@@ -2,6 +2,7 @@ package ees
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -21,7 +22,7 @@ func TestHandleCreateSubscription(t *testing.T) {
 	t.Run("ValidPeriodicSubscription", func(t *testing.T) {
 		reqBody := createSubscriptionRequest{
 			Subscription: UpfEventSubscription{
-				NfID:           "test-nf",
+				NfID:                "test-nf",
 				EventNotifyURI:      "http://localhost:9999/notify",
 				NotifyCorrelationID: "test-corr",
 				EventList: []UpfEvent{
@@ -39,15 +40,16 @@ func TestHandleCreateSubscription(t *testing.T) {
 			},
 		}
 
-		body, _ := json.Marshal(reqBody)
-		req := httptest.NewRequest(http.MethodPost, "/nupf-ee/v1/ee-subscriptions", bytes.NewReader(body))
+		body, err := json.Marshal(reqBody)
+		require.NoError(t, err)
+		req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/nupf-ee/v1/ee-subscriptions", bytes.NewReader(body))
 		rr := httptest.NewRecorder()
 
 		server.handleCreateSubscription(rr, req)
 
 		assert.Equal(t, http.StatusCreated, rr.Code)
 		var resp createSubscriptionResponse
-		err := json.Unmarshal(rr.Body.Bytes(), &resp)
+		err = json.Unmarshal(rr.Body.Bytes(), &resp)
 		require.NoError(t, err)
 		assert.NotEmpty(t, resp.SubscriptionID)
 
@@ -67,8 +69,9 @@ func TestHandleCreateSubscription(t *testing.T) {
 			},
 		}
 
-		body, _ := json.Marshal(reqBody)
-		req := httptest.NewRequest(http.MethodPost, "/nupf-ee/v1/ee-subscriptions", bytes.NewReader(body))
+		body, err := json.Marshal(reqBody)
+		require.NoError(t, err)
+		req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/nupf-ee/v1/ee-subscriptions", bytes.NewReader(body))
 		rr := httptest.NewRecorder()
 
 		server.handleCreateSubscription(rr, req)
@@ -84,8 +87,9 @@ func TestHandleCreateSubscription(t *testing.T) {
 			},
 		}
 
-		body, _ := json.Marshal(reqBody)
-		req := httptest.NewRequest(http.MethodPost, "/nupf-ee/v1/ee-subscriptions", bytes.NewReader(body))
+		body, err := json.Marshal(reqBody)
+		require.NoError(t, err)
+		req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/nupf-ee/v1/ee-subscriptions", bytes.NewReader(body))
 		rr := httptest.NewRecorder()
 
 		server.handleCreateSubscription(rr, req)
@@ -106,8 +110,9 @@ func TestHandleCreateSubscription(t *testing.T) {
 			},
 		}
 
-		body, _ := json.Marshal(reqBody)
-		req := httptest.NewRequest(http.MethodPost, "/nupf-ee/v1/ee-subscriptions", bytes.NewReader(body))
+		body, err := json.Marshal(reqBody)
+		require.NoError(t, err)
+		req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/nupf-ee/v1/ee-subscriptions", bytes.NewReader(body))
 		rr := httptest.NewRecorder()
 
 		server.handleCreateSubscription(rr, req)
@@ -129,13 +134,17 @@ func TestHandleCreateSubscription(t *testing.T) {
 		id, err := store.CreateSubscription(sub)
 		require.NoError(t, err)
 
-		req := httptest.NewRequest(http.MethodDelete, "/nupf-ee/v1/ee-subscriptions/"+id, nil)
+		req := httptest.NewRequestWithContext(context.Background(), http.MethodDelete, "/nupf-ee/v1/ee-subscriptions/"+id, nil)
 		rr := httptest.NewRecorder()
 
 		server.handleDeleteSubscriptionByID(rr, req)
 
 		assert.Equal(t, http.StatusNoContent, rr.Code)
 		_, ok := store.GetSubscription(id)
+		assert.False(t, ok)
+	})
+}
+on(id)
 		assert.False(t, ok)
 	})
 }
