@@ -144,7 +144,4 @@ func TestHandleCreateSubscription(t *testing.T) {
 		assert.False(t, ok)
 	})
 }
-on(id)
-		assert.False(t, ok)
-	})
-}
+

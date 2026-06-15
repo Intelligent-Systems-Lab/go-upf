@@ -486,12 +486,3 @@ func (aggregator *Aggregator) AdjustReportPeriod(urrPeriod time.Duration) bool {
 
 	return true
 }
-lect {
-	case aggregator.tickerReset <- struct{}{}:
-		aggregator.logger.Debug("ees ticker reset signal sent")
-	default:
-		aggregator.logger.Debug("ees ticker reset signal already pending")
-	}
-
-	return true
-}
