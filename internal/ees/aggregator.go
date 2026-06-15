@@ -124,13 +124,6 @@ func (aggregator *Aggregator) Run(parentContext context.Context) {
 	}
 }
 
-// getTicker safely retrieves the current ticker
-func (aggregator *Aggregator) getTicker() *time.Ticker {
-	aggregator.tickerMu.Lock()
-	defer aggregator.tickerMu.Unlock()
-	return aggregator.ticker
-}
-
 // TickOnce sends notifications using accumulated reports from the Push buffer.
 // This is the Pure Push model - no active polling.
 // Reports for the same session are consolidated into a single report.

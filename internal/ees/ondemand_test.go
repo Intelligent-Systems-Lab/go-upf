@@ -114,6 +114,7 @@ type mockSessionProvider struct {
 func (m *mockSessionProvider) GetSessionContexts() map[uint64]SessionContext {
 	return m.sessions
 }
+
 func (m *mockSessionProvider) GetSessionContextUEIP(lSeid uint64) (string, bool) {
 	ctx, ok := m.sessions[lSeid]
 	return ctx.UeIPv4Addr, ok

@@ -134,7 +134,7 @@ func TestHandleCreateSubscription(t *testing.T) {
 		id, err := store.CreateSubscription(sub)
 		require.NoError(t, err)
 
-		req := httptest.NewRequest(http.MethodDelete, "/nupf-ee/v1/ee-subscriptions/"+id, nil)
+		req := httptest.NewRequestWithContext(context.Background(), http.MethodDelete, "/nupf-ee/v1/ee-subscriptions/"+id, nil)
 		rr := httptest.NewRecorder()
 
 		server.handleDeleteSubscriptionByID(rr, req)
@@ -144,3 +144,4 @@ func TestHandleCreateSubscription(t *testing.T) {
 		assert.False(t, ok)
 	})
 }
+
