@@ -17,6 +17,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -82,8 +83,14 @@ type UpfEventSubscription struct {
 	EventReportingMode  UpfEventMode `json:"eventReportingMode"`
 
 	// Targeting: choose one
-	UeIPAddress string `json:"ueIpAddress,omitempty"`
-	AnyUE       bool   `json:"anyUe,omitempty"`
+	UEIPAddress *IPAddr `json:"ueIpAddress,omitempty"`
+	AnyUE       bool    `json:"anyUe,omitempty"`
+}
+
+type IPAddr struct {
+	IPv4Addr   string `json:"ipv4Addr,omitempty"`
+	IPv6Addr   string `json:"ipv6Addr,omitempty"`
+	IPv6Prefix string `json:"ipv6Prefix,omitempty"`
 }
 
 type UpfEvent struct {
@@ -99,8 +106,8 @@ type UpfEvent struct {
 }
 
 type UpfEventMode struct {
-	Trigger      string `json:"trigger"`                // "PERIODIC" | "ONE_TIME"
-	ReportPeriod int    `json:"reportPeriod,omitempty"` // Seconds
+	Trigger   string `json:"trigger"`             // "PERIODIC" | "ONE_TIME"
+	RepPeriod int    `json:"repPeriod,omitempty"` // Seconds
 }
 
 type createSubscriptionResponse struct {
@@ -193,12 +200,16 @@ func (server *Server) handleCreateSubscription(w http.ResponseWriter, r *http.Re
 			EventNotifyURI:      subscriptionCandidate.NotifURI,
 			NotifyCorrelationID: subscriptionCandidate.NotifyCorrelationID,
 			EventReportingMode: UpfEventMode{
-				Trigger:      inboundRequest.Subscription.EventReportingMode.Trigger,
-				ReportPeriod: subscriptionCandidate.PeriodSec,
+				Trigger:   inboundRequest.Subscription.EventReportingMode.Trigger,
+				RepPeriod: subscriptionCandidate.PeriodSec,
 			},
-			AnyUE:       subscriptionCandidate.Target.AnyUE,
-			UeIPAddress: subscriptionCandidate.Target.UeIPAddress,
+			AnyUE: subscriptionCandidate.Target.AnyUE,
 		},
+	}
+	if subscriptionCandidate.Target.UeIPAddress != "" {
+		response.Subscription.UEIPAddress = &IPAddr{
+			IPv4Addr: subscriptionCandidate.Target.UeIPAddress,
+		}
 	}
 
 	if err := json.NewEncoder(w).Encode(response); err != nil {
@@ -342,7 +353,7 @@ func (server *Server) validateAndBuildSubscription(req createSubscriptionRequest
 		return nil, fmt.Errorf("not supported yet: trigger %s", sub.EventReportingMode.Trigger)
 	}
 
-	periodSec := sub.EventReportingMode.ReportPeriod
+	periodSec := sub.EventReportingMode.RepPeriod
 	if periodSec <= 0 {
 		// Fallback for periodic if not specified
 		if chosenMode == ModePeriodic {
@@ -390,14 +401,19 @@ func (server *Server) validateAndBuildSubscription(req createSubscriptionRequest
 	// Must verify one of ueIpAddress or anyUe=true is present.
 	target := TargetScope{}
 	if sub.AnyUE {
-		if sub.UeIPAddress != "" {
+		if sub.UEIPAddress != nil {
 			return nil, fmt.Errorf("invalid targeting: cannot specify both anyUe and ueIpAddress")
 		}
 		target.AnyUE = true
-	} else if sub.UeIPAddress != "" {
-		target.UeIPAddress = sub.UeIPAddress
+	} else if sub.UEIPAddress != nil && sub.UEIPAddress.IPv4Addr != "" &&
+		sub.UEIPAddress.IPv6Addr == "" && sub.UEIPAddress.IPv6Prefix == "" {
+		ipv4 := net.ParseIP(sub.UEIPAddress.IPv4Addr)
+		if ipv4 == nil || ipv4.To4() == nil {
+			return nil, fmt.Errorf("invalid ueIpAddress.ipv4Addr")
+		}
+		target.UeIPAddress = ipv4.To4().String()
 	} else {
-		return nil, fmt.Errorf("missing target: must specify either anyUe=true or provide ueIpAddress")
+		return nil, fmt.Errorf("missing or unsupported target: provide anyUe=true or an IPv4 ueIpAddress")
 	}
 
 	// Build subscription object.
@@ -447,7 +463,7 @@ curl -X POST http://127.0.0.1:8088/nupf-ee/v1/ee-subscriptions \
       }],
       "eventNotifyUri": "http://127.0.0.1:9000/callback",
       "notifyCorrelationId": "corr-session-001",
-      "eventReportingMode": {"trigger": "PERIODIC", "reportPeriod": 30},
+      "eventReportingMode": {"trigger": "PERIODIC", "repPeriod": 30},
       "anyUe": true
     }
   }'
@@ -465,7 +481,7 @@ curl -X POST http://127.0.0.1:8088/nupf-ee/v1/ee-subscriptions \
       "eventNotifyUri": "http://127.0.0.1:9000/callback",
       "notifyCorrelationId": "corr-ue-001",
       "eventReportingMode": {"trigger": "ONE_TIME"},
-      "ueIpAddress": "10.10.0.1"
+      "ueIpAddress": {"ipv4Addr": "10.10.0.1"}
     }
   }'
 */

@@ -47,7 +47,7 @@ When a subscription is created successfully, the API returns `201 Created` with 
     }],
     "eventNotifyUri": "http://127.0.0.1:9000/callback",
     "notifyCorrelationId": "corr-session-001",
-    "eventReportingMode": {"trigger": "PERIODIC", "reportPeriod": 30},
+    "eventReportingMode": {"trigger": "PERIODIC", "repPeriod": 30},
     "anyUe": true
   }
 }
@@ -233,7 +233,7 @@ curl -X POST http://127.0.0.1:8088/nupf-ee/v1/ee-subscriptions \
       }],
       "eventNotifyUri": "http://127.0.0.1:9000/callback",
       "notifyCorrelationId": "corr-session-001",
-      "eventReportingMode": {"trigger": "PERIODIC", "reportPeriod": 30},
+      "eventReportingMode": {"trigger": "PERIODIC", "repPeriod": 30},
       "anyUe": true
     }
   }'
@@ -255,7 +255,7 @@ curl -X POST http://127.0.0.1:8088/nupf-ee/v1/ee-subscriptions \
       }],
       "eventNotifyUri": "http://127.0.0.1:9000/callback",
       "notifyCorrelationId": "corr-app-001",
-      "eventReportingMode": {"trigger": "PERIODIC", "reportPeriod": 60},
+      "eventReportingMode": {"trigger": "PERIODIC", "repPeriod": 60},
       "anyUe": true
     }
   }'
@@ -279,8 +279,8 @@ curl -X POST http://127.0.0.1:8088/nupf-ee/v1/ee-subscriptions \
       }],
       "eventNotifyUri": "http://127.0.0.1:9000/callback",
       "notifyCorrelationId": "corr-flow-001",
-      "eventReportingMode": {"trigger": "PERIODIC", "reportPeriod": 10},
-      "ueIpAddress": "10.60.0.1"
+      "eventReportingMode": {"trigger": "PERIODIC", "repPeriod": 10},
+      "ueIpAddress": {"ipv4Addr": "10.60.0.1"}
     }
   }'
 ```
@@ -300,7 +300,7 @@ curl -X POST http://127.0.0.1:8088/nupf-ee/v1/ee-subscriptions \
       "eventNotifyUri": "http://127.0.0.1:9000/callback",
       "notifyCorrelationId": "corr-onetime-001",
       "eventReportingMode": {"trigger": "ONE_TIME"},
-      "ueIpAddress": "10.60.0.1"
+      "ueIpAddress": {"ipv4Addr": "10.60.0.1"}
     }
   }'
 ```
@@ -315,7 +315,7 @@ curl -X POST http://127.0.0.1:8088/nupf-ee/v1/ee-subscriptions \
 | `granularityOfMeasurement = PER_APPLICATION` | `appIds` is mandatory |
 | `granularityOfMeasurement = PER_FLOW` | `trafficFilters` is mandatory |
 | Targeting | Either `anyUe: true` OR `ueIpAddress` |
-| `reportPeriod` (PERIODIC mode) | Must be ≥ URR period and a multiple of it |
+| `repPeriod` (PERIODIC mode) | Must be ≥ URR period and a multiple of it |
 
 ---
 
